@@ -1,0 +1,19 @@
+# Data & caches
+.cache/
+data/
+models/splits/
+models/*.pt
+models/*.npy
+models/*.bin
+
+# Python
+.venv
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# Logs
+models/training_output.log
+models/training_log.jsonl
