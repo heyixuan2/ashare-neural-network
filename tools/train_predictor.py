@@ -754,13 +754,13 @@ def train(data, max_hours=72, seed=42, model_id=0):
     seq_len = X_train.shape[1]
     log(f"Train: {n_train}, Val: {len(X_val)}, Test: {len(X_test)}, Features: {input_dim}")
 
-    # V3: 1d-only, smaller model, stronger regularization
-    # Evidence from V2.6: 3d/5d ≈ random, best epoch=2, 1.2M params overfit fast
-    smooth = 0.1  # stronger label smoothing (was 0.03)
+    # V4: lower LR, smaller batch, plain BCE, no SWA
+    # V3 evidence: best epoch=1 at warmup lr=1e-4, lr=3e-4 overshoots
+    smooth = 0.05  # lighter smoothing (V3's 0.1 was too aggressive)
 
     # Custom dataset - 1d only
     class MmapDataset(torch.utils.data.Dataset):
-        def __init__(self, X_mmap, y1, smooth=0.1):
+        def __init__(self, X_mmap, y1, smooth=0.05):
             self.X, self.y1 = X_mmap, y1
             self.n = len(X_mmap)
             self.smooth = smooth
@@ -771,16 +771,16 @@ def train(data, max_hours=72, seed=42, model_id=0):
             y1 = np.clip(float(self.y1[idx]), self.smooth, 1.0 - self.smooth)
             return x, torch.tensor(y1, dtype=torch.float32)
 
-    # Hyperparameters — smaller model to match weak signal
-    batch_size = 1024
-    lr = 3e-4
-    wd = 5e-2  # strong weight decay (was 1e-2)
-    hidden_dim = 64   # was 128
-    n_heads = 4       # was 8
-    n_layers = 2      # was 4
-    lstm_layers = 1   # was 3
-    max_epochs = 200  # was 500
-    patience = 10     # was 30 (signal peaks at epoch 2-5, no point waiting 30)
+    # V4 hyperparameters
+    batch_size = 256   # was 1024 — smaller batch = implicit regularization
+    lr = 1e-4          # was 3e-4 — V3 best epoch was at warmup lr=1e-4
+    wd = 5e-2
+    hidden_dim = 64
+    n_heads = 4
+    n_layers = 2
+    lstm_layers = 1
+    max_epochs = 60    # was 200 — with constant lr, no need for many epochs
+    patience = 15      # was 10 — give more room with lower lr
 
     # Class balance - 1d only
     def real_mean(arr):
@@ -789,8 +789,6 @@ def train(data, max_hours=72, seed=42, model_id=0):
         return np.mean(real) if len(real) > 0 else 0.5
     y1_mean = real_mean(y_train[1])
     log(f"Class balance: 1d_up={y1_mean:.3f}")
-    focal_alpha_1d = 1.0 - y1_mean
-    log(f"Focal alpha: 1d={focal_alpha_1d:.3f}")
     log(f"Batch size: {batch_size}, LR: {lr:.6f}, Weight decay: {wd}")
     log(f"Model: hidden={hidden_dim}, heads={n_heads}, layers={n_layers}, lstm={lstm_layers}")
 
@@ -836,53 +834,24 @@ def train(data, max_hours=72, seed=42, model_id=0):
     log(f"Model: {total_params:,} parameters")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-    # CosineAnnealingWarmRestarts - works with early stopping (no total_steps dependency)
-    # T_0=10: restart every 10 epochs, T_mult=2: period doubles each restart (10, 20, 40...)
-    # This gives warm restarts that can escape local minima
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=10, T_mult=2, eta_min=lr * 0.001)
-    # Warmup: manually ramp LR for first 3 epochs
-    warmup_epochs = 3
+    # Constant LR — V3 showed best epoch at lr=1e-4, cosine schedule didn't help
+    # No warmup, no scheduler: just train at the sweet spot
 
-    # Asymmetric Focal Loss - penalizes false positives more than false negatives
-    # In trading: predicting "up" when it goes down = you lose money
-    # Predicting "down" when it goes up = you just miss a trade
-    # FP_weight > FN_weight
-    class AsymmetricFocalBCE(nn.Module):
-        def __init__(self, gamma=1.5, alpha=0.5, fp_penalty=1.3):
-            super().__init__()
-            self.gamma = gamma
-            self.alpha = alpha
-            self.fp_penalty = fp_penalty  # extra penalty for false positives
+    # Plain BCE with valid-sample masking (0.5 = unknown label, skip)
+    class MaskedBCE(nn.Module):
         def forward(self, pred, target):
             pred = torch.clamp(pred, 1e-7, 1 - 1e-7)
-            # Mask out 0.5 fill labels (NaN-filled unknowns) - they should contribute 0 loss
-            # After label smoothing: real labels are 0.03 or 0.97, fills stay at 0.5
-            # Use range [0.45, 0.55] to catch smoothed fills too
             valid = (target < 0.45) | (target > 0.55)
             if valid.sum() == 0:
                 return torch.tensor(0.0, device=pred.device, requires_grad=True)
-            pred = pred[valid]
-            target = target[valid]
-            bce = nn.functional.binary_cross_entropy(pred, target, reduction='none')
-            pt = torch.where(target > 0.5, pred, 1 - pred)
-            alpha_t = torch.where(target > 0.5, self.alpha, 1.0 - self.alpha)
-            focal = alpha_t * (1 - pt) ** self.gamma * bce
-            # Extra penalty: when pred > 0.5 but target = 0 (false positive)
-            fp_mask = (pred > 0.5) & (target < 0.5)
-            focal = torch.where(fp_mask, focal * self.fp_penalty, focal)
-            return focal.mean()
+            return nn.functional.binary_cross_entropy(pred[valid], target[valid])
 
-    criterion = AsymmetricFocalBCE(gamma=1.5, alpha=focal_alpha_1d, fp_penalty=1.3)
+    criterion = MaskedBCE()
 
-    # No gradient accumulation — batch_size=1024 is already large enough
-    accum_steps = 1
-    log(f"Effective batch size: {batch_size}")
-
-    # SWA — start early enough to activate before patience kicks in
-    swa_model = torch.optim.swa_utils.AveragedModel(model)
-    swa_start = 7
-    swa_active = False
+    # Gradient accumulation: effective batch = 256 * 4 = 1024
+    # Small per-step batch for noise, but accumulated gradient is stable
+    accum_steps = 4
+    log(f"Effective batch size: {batch_size * accum_steps} (micro={batch_size} × accum={accum_steps})")
 
     best_val_loss = float('inf')
     best_val_acc = 0
@@ -898,7 +867,7 @@ def train(data, max_hours=72, seed=42, model_id=0):
     meta_path = MODEL_DIR / f"predictor_meta{suffix}.json"
     loss_curve_path = MODEL_DIR / f"loss_curve{suffix}.json"
 
-    log(f"Training: max {max_epochs} epochs, patience {patience}, SWA@epoch {swa_start}")
+    log(f"Training: max {max_epochs} epochs, patience {patience}, constant lr={lr}")
 
     for epoch in range(max_epochs):
         elapsed = time.time() - start_time
@@ -921,12 +890,12 @@ def train(data, max_hours=72, seed=42, model_id=0):
 
             pred = model(bx)
             loss = criterion(pred.squeeze(), by1)
+            loss = loss / accum_steps
             loss.backward()
 
-            train_loss += loss.item()
+            train_loss += loss.item() * accum_steps
             n_batches += 1
 
-            # Step optimizer every accum_steps
             if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
                 gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 grad_norms.append(gn.item() if hasattr(gn, 'item') else float(gn))
@@ -935,15 +904,6 @@ def train(data, max_hours=72, seed=42, model_id=0):
 
         train_loss /= max(n_batches, 1)
         avg_gn = np.mean(grad_norms) if grad_norms else 0
-
-        # LR scheduling: warmup then cosine annealing
-        if epoch < warmup_epochs:
-            # Linear warmup
-            warmup_lr = lr * (epoch + 1) / warmup_epochs
-            for pg in optimizer.param_groups:
-                pg['lr'] = warmup_lr
-        else:
-            scheduler.step(epoch - warmup_epochs)
 
         # Validation (batched from mmap) — 1d only
         model.eval()
@@ -1016,13 +976,6 @@ def train(data, max_hours=72, seed=42, model_id=0):
             f"acc: 1d={acc1*100:.1f}% | "
             f"grad={avg_gn:.3f} lr={lr_now:.2e} | {epoch_time:.1f}s | {'★' if improved else ''}")
 
-        # SWA
-        if epoch >= swa_start:
-            if not swa_active:
-                log(f"SWA activated at epoch {epoch+1}")
-                swa_active = True
-            swa_model.update_parameters(model)
-
         if no_improve >= patience:
             log(f"Early stopping at epoch {epoch+1} (no improve for {patience} epochs)")
             break
@@ -1030,32 +983,6 @@ def train(data, max_hours=72, seed=42, model_id=0):
     # ── Final model selection ──
     if best_state:
         model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-
-    if swa_active:
-        log("Comparing SWA vs best checkpoint...")
-        torch.optim.swa_utils.update_bn(train_loader, swa_model, device=device)
-        swa_model.eval()
-        # Batched SWA evaluation (full val, avoid OOM)
-        swa_correct, swa_valid_count = 0, 0
-        with torch.no_grad():
-            for vs in range(0, len(X_val), 1024):
-                ve = min(vs + 1024, len(X_val))
-                xb = torch.FloatTensor(np.array(X_val[vs:ve])).to(device)
-                sp = swa_model(xb)
-                yb = torch.FloatTensor(np.array(y_val[1][vs:ve]))
-                valid = (yb != 0.5)
-                if valid.sum() > 0:
-                    swa_correct += ((sp.squeeze().cpu()[valid] > 0.5).float() == yb[valid]).float().sum().item()
-                    swa_valid_count += valid.sum().item()
-        swa_avg = swa_correct / max(swa_valid_count, 1)
-        log(f"SWA avg_acc={swa_avg*100:.1f}% vs best={best_val_acc*100:.1f}%")
-        if swa_avg > best_val_acc:
-            log("★ SWA wins!")
-            # SWA state_dict has 'module.' prefix and extra keys like 'n_averaged'
-            best_state = {k.replace("module.", ""): v.cpu().clone()
-                          for k, v in swa_model.state_dict().items()
-                          if not k.startswith("n_averaged")}
-            model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
 
     torch.save(best_state, checkpoint_path)
     loss_curve_path.write_text(json.dumps(history, indent=2))
@@ -1129,13 +1056,92 @@ def train(data, max_hours=72, seed=42, model_id=0):
     else:
         log(f"✅ No overfitting: val={best_val_acc*100:.1f}% ≈ test={test_avg*100:.1f}% (gap={gap:.1f}%)")
 
-    # Profitability
+    # ── Temperature Scaling (post-hoc calibration on val set) ──
     log(f"")
-    log(f"── Profitability (1-day, threshold=0.55) ──")
-    long_mask = tp1 > 0.55
+    log(f"── Temperature Scaling (calibrate on val set) ──")
+
+    # Extract pre-sigmoid logits from a mmap array (reused for val + test)
+    head_layers = list(model.head.children())
+    def extract_logits(X_mmap, n):
+        logits_all = []
+        with torch.no_grad():
+            for s in range(0, n, 1024):
+                e = min(s + 1024, n)
+                xb = torch.FloatTensor(np.array(X_mmap[s:e])).to(device)
+                x_enc = model.input_proj(xb)
+                h, _ = model.lstm(x_enc)
+                h = model.lstm_norm(h) + model.pos_enc
+                t = model.out_norm(model.transformer(h))
+                w = torch.softmax(model.attn_pool(t), dim=1)
+                p = (t * w).sum(dim=1)
+                z = p
+                for layer in head_layers[:-1]:  # skip Sigmoid()
+                    z = layer(z)
+                logits_all.append(z.squeeze().cpu())
+        return torch.cat(logits_all)
+
+    model.eval()
+    val_logits = extract_logits(X_val, len(X_val))
+    val_labels = torch.FloatTensor(np.array(y_val[1][:len(X_val)]))
+    val_valid = (val_labels < 0.45) | (val_labels > 0.55)
+
+    # Optimize temperature T to minimize NLL on valid val samples
+    best_T, best_nll = 1.0, float('inf')
+    for T_cand in [t / 10.0 for t in range(5, 31)]:  # 0.5 to 3.0
+        scaled = torch.sigmoid(val_logits[val_valid] / T_cand)
+        nll = nn.functional.binary_cross_entropy(
+            torch.clamp(scaled, 1e-7, 1-1e-7), val_labels[val_valid]).item()
+        if nll < best_nll:
+            best_nll = nll
+            best_T = T_cand
+    log(f"  Optimal temperature: T={best_T:.1f} (NLL={best_nll:.4f})")
+
+    # ── Optimal Threshold Search on val set ──
+    log(f"── Optimal Threshold Search ──")
+    test_logits = extract_logits(X_test, test_n)
+    tp1_cal = torch.sigmoid(test_logits / best_T).numpy()
+
+    # Search threshold on val calibrated probs for best F1
+    val_cal = torch.sigmoid(val_logits / best_T).numpy()
+    val_labels_np = val_labels.numpy()
+    val_v = (val_labels_np < 0.45) | (val_labels_np > 0.55)
+
+    best_thresh, best_f1 = 0.5, 0
+    for th in [t / 100.0 for t in range(45, 70)]:  # 0.45 to 0.69
+        pred_b = (val_cal[val_v] > th).astype(float)
+        tp_v = np.sum((pred_b == 1) & (val_labels_np[val_v] > 0.5))
+        fp_v = np.sum((pred_b == 1) & (val_labels_np[val_v] < 0.5))
+        fn_v = np.sum((pred_b == 0) & (val_labels_np[val_v] > 0.5))
+        prec_v = tp_v / max(tp_v + fp_v, 1)
+        rec_v = tp_v / max(tp_v + fn_v, 1)
+        f1_v = 2 * prec_v * rec_v / max(prec_v + rec_v, 1e-8)
+        if f1_v > best_f1:
+            best_f1 = f1_v
+            best_thresh = th
+    log(f"  Optimal threshold: {best_thresh:.2f} (val F1={best_f1*100:.1f}%)")
+
+    # Report calibrated test metrics
+    log(f"")
+    log(f"── Calibrated Test Metrics (T={best_T:.1f}, thresh={best_thresh:.2f}) ──")
+    test_pred_cal = (tp1_cal > best_thresh).astype(float)
+    tv = (ty1 != 0.5)
+    tp_c = np.sum((test_pred_cal[tv] == 1) & (ty1[tv] == 1))
+    fp_c = np.sum((test_pred_cal[tv] == 1) & (ty1[tv] == 0))
+    fn_c = np.sum((test_pred_cal[tv] == 0) & (ty1[tv] == 1))
+    prec_c = tp_c / max(tp_c + fp_c, 1)
+    rec_c = tp_c / max(tp_c + fn_c, 1)
+    f1_c = 2 * prec_c * rec_c / max(prec_c + rec_c, 1e-8)
+    cal_acc = np.mean((test_pred_cal[tv]) == ty1[tv])
+    log(f"  Accuracy={cal_acc*100:.1f}% Precision={prec_c*100:.1f}% Recall={rec_c*100:.1f}% F1={f1_c*100:.1f}%")
+    log(f"  Pred mean={tp1_cal.mean():.3f} Actual={ty1.mean():.3f}")
+
+    # Profitability with optimal threshold
+    log(f"")
+    log(f"── Profitability (1-day, calibrated thresh={best_thresh:.2f}) ──")
+    long_mask = tp1_cal > best_thresh
     if long_mask.sum() > 0:
         wr = np.mean(ty1[long_mask])
-        log(f"  Trades: {long_mask.sum()}/{len(tp1)} ({long_mask.sum()/len(tp1)*100:.1f}%)")
+        log(f"  Trades: {long_mask.sum()}/{len(tp1_cal)} ({long_mask.sum()/len(tp1_cal)*100:.1f}%)")
         log(f"  Win rate: {wr*100:.1f}% vs baseline: {ty1.mean()*100:.1f}%")
         log(f"  Edge: {(wr - ty1.mean())*100:+.1f}%")
 
@@ -1144,6 +1150,10 @@ def train(data, max_hours=72, seed=42, model_id=0):
     meta["test_accuracy_1d"] = round(test_acc1*100, 1)
     meta["test_avg_accuracy"] = round(test_avg*100, 1)
     meta["overfit_gap"] = round(gap, 1)
+    meta["temperature"] = best_T
+    meta["optimal_threshold"] = best_thresh
+    meta["calibrated_f1"] = round(f1_c*100, 1)
+    meta["calibrated_accuracy"] = round(cal_acc*100, 1)
     meta_path.write_text(json.dumps(meta, indent=2))
 
     total_time = time.time() - start_time
@@ -1181,7 +1191,7 @@ def train_ensemble(data, n_models=3, max_hours_per_model=24):
 
 if __name__ == "__main__":
     log("=" * 60)
-    log("Stock Price Predictor - Large-Scale Training V3 (1d-only)")
+    log("Stock Price Predictor - Large-Scale Training V4 (1d-only)")
     log("=" * 60)
     data = collect_data()
     # Train 3 models for ensemble (8h each max = 24h total max)

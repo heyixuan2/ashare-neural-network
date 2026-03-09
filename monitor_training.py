@@ -269,7 +269,7 @@ def draw_collection(info):
     fdim = info["feature_dim"]
 
     print("\033[1;32m╔══════════════════════════════════════════════════════════════════╗")
-    print(f"║       LSTM-Transformer V3 训练监控  ({fdim}维特征, 1d-only)     ║")
+    print(f"║       LSTM-Transformer V4 训练监控  ({fdim}维特征, 1d-only)     ║")
     print("╚══════════════════════════════════════════════════════════════════╝\033[0m")
     print()
 
@@ -535,16 +535,33 @@ def parse_test_results(status_msgs):
                 pass
         if "No overfitting" in m or "Overfitting" in m:
             results["overfit_msg"] = m.strip()
-        if "SWA avg_acc" in m:
-            results["swa_msg"] = m.strip()
-        if "SWA wins" in m:
-            results["swa_won"] = True
         if "Calibration: pred_up_1d" in m:
             try:
                 pred = float(m.split("pred_up_1d=")[1].split()[0])
                 actual = float(m.split("actual=")[1].strip())
                 results["cal_1d_pred"] = pred
                 results["cal_1d_actual"] = actual
+            except:
+                pass
+        if "Optimal temperature:" in m:
+            try:
+                results["temperature"] = float(m.split("T=")[1].split()[0])
+            except:
+                pass
+        if "Optimal threshold:" in m:
+            try:
+                results["opt_threshold"] = float(m.split("threshold:")[1].split()[0])
+                results["val_f1"] = m.split("val F1=")[1].split(")")[0].strip() if "val F1=" in m else ""
+            except:
+                pass
+        if "Calibrated Test Metrics" in m:
+            results["has_calibrated"] = True
+        if "has_calibrated" in results and "Accuracy=" in m and "Precision=" in m:
+            try:
+                results["cal_acc"] = m.split("Accuracy=")[1].split("%")[0].strip()
+                results["cal_prec"] = m.split("Precision=")[1].split("%")[0].strip()
+                results["cal_rec"] = m.split("Recall=")[1].split("%")[0].strip()
+                results["cal_f1"] = m.split("F1=")[1].split("%")[0].strip()
             except:
                 pass
     return results
@@ -595,7 +612,7 @@ def draw_training(epochs, status_msgs):
     feature_dim = get_feature_dim()
 
     print("\033[1;32m╔══════════════════════════════════════════════════════════════════╗")
-    print(f"║       LSTM-Transformer V3 训练监控  ({feature_dim}维特征, 1d-only)     ║")
+    print(f"║       LSTM-Transformer V4 训练监控  ({feature_dim}维特征, 1d-only)     ║")
     print("╚══════════════════════════════════════════════════════════════════╝\033[0m")
     print()
 
@@ -610,18 +627,12 @@ def draw_training(epochs, status_msgs):
             info["params"] = m.strip()
         if "Class balance" in m:
             info["balance"] = m.strip()
-        if "Focal alpha" in m:
-            info["alpha"] = m.strip()
-        if "Batch size" in m:
+        if "Batch size" in m or "Effective batch" in m:
             info["batch"] = m.strip()
-        if "accumulation" in m:
-            info["accum"] = m.strip()
         if "seed" in m.lower() and "Model" in m:
             info["seed"] = m.strip()
         if "Training:" in m and "patience" in m:
             info["plan"] = m.strip()
-        if "SWA activated" in m:
-            info["swa"] = m.strip()
         if "Early stopping" in m:
             info["stop"] = m.strip()
 
@@ -633,13 +644,11 @@ def draw_training(epochs, status_msgs):
         print()
 
     print(f"  \033[36m{'─' * 64}\033[0m")
-    for key in ["device", "seed", "data", "params", "balance", "alpha", "batch", "accum", "plan"]:
+    for key in ["device", "seed", "data", "params", "balance", "batch", "plan"]:
         if key in info:
             print(f"  \033[36m│\033[0m {info[key]}")
-    for key in ["swa", "stop"]:
-        if key in info:
-            color = "\033[33m" if key == "swa" else "\033[31m"
-            print(f"  \033[36m│\033[0m {color}{info[key]}\033[0m")
+    if "stop" in info:
+        print(f"  \033[36m│\033[0m \033[31m{info['stop']}\033[0m")
     print(f"  \033[36m{'─' * 64}\033[0m")
     print()
 
@@ -651,7 +660,7 @@ def draw_training(epochs, status_msgs):
     if latest["best"]:
         print("\033[1;33m★ NEW BEST\033[0m")
     else:
-        patience = 10
+        patience = 15
         print(f"\033[90m(best=E{best['epoch']}, patience {since_best}/{patience})\033[0m")
     print()
 
@@ -799,9 +808,14 @@ def draw_training(epochs, status_msgs):
             cal_diff = abs(test["cal_1d_pred"] - test["cal_1d_actual"])
             cal_icon = "✅" if cal_diff < 0.05 else "⚠️"
             print(f"    校准: pred_mean={test['cal_1d_pred']:.3f} actual={test['cal_1d_actual']:.3f}  {cal_icon}")
-        if test.get("swa_msg"):
-            swa_icon = "🏆" if test.get("swa_won") else ""
-            print(f"    SWA: {test['swa_msg']}  {swa_icon}")
+        if test.get("temperature"):
+            print(f"    \033[1;36m温度校准:\033[0m T={test['temperature']:.1f} "
+                  f"| 最优阈值={test.get('opt_threshold', 0.5):.2f} "
+                  f"(val F1={test.get('val_f1', '?')})")
+        if test.get("cal_acc"):
+            print(f"    \033[1;36m校准后测试:\033[0m "
+                  f"Acc={test['cal_acc']}% P={test['cal_prec']}% "
+                  f"R={test['cal_rec']}% F1={test['cal_f1']}%")
         if test.get("overfit_msg"):
             print(f"    {test['overfit_msg']}")
         print()
@@ -810,9 +824,9 @@ def draw_training(epochs, status_msgs):
     total_time = sum(e["time"] for e in epochs)
     avg_time = total_time / len(epochs)
     print(f"  \033[1m⏱️ 时间:\033[0m")
-    print(f"    每Epoch: {avg_time:.0f}s | 已用: {total_time / 3600:.1f}h | patience: {since_best}/10")
-    if since_best < 10 and not test.get("test_avg"):
-        remaining = (10 - since_best) * avg_time
+    print(f"    每Epoch: {avg_time:.0f}s | 已用: {total_time / 3600:.1f}h | patience: {since_best}/15")
+    if since_best < 15 and not test.get("test_avg"):
+        remaining = (15 - since_best) * avg_time
         print(f"    最多还需: {remaining / 3600:.1f}h (当前模型)")
     if ens["total"] > 1:
         models_left = ens["total"] - ens["done"] - 1
