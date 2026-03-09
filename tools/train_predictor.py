@@ -1088,10 +1088,18 @@ def train(data, max_hours=72, seed=42, model_id=0):
     log(f"  Best long threshold: {best_edge_thresh:.2f} (edge={best_edge*100:+.1f}%)")
 
     # ── Optimal Threshold Search on val set (maximize edge, min 100 trades) ──
+    # Re-run val inference with best model (vp1_all from training loop is stale — last epoch, not best)
     log(f"")
     log(f"── Optimal Threshold Search (val set, maximize edge) ──")
-    vp1 = torch.cat(vp1_all).numpy()
-    vy1_np = torch.cat(vy1_all).numpy()
+    vp1_best = []
+    with torch.no_grad():
+        for vs in range(0, len(X_val), 1024):
+            ve = min(vs + 1024, len(X_val))
+            xb = torch.FloatTensor(np.array(X_val[vs:ve])).to(device)
+            pred = model(xb)
+            vp1_best.append(pred.squeeze().cpu())
+    vp1 = torch.cat(vp1_best).numpy()
+    vy1_np = np.array(y_val[1][:len(X_val)])
     val_v = (vy1_np != 0.5)
     val_baseline = vy1_np[val_v].mean()
 
