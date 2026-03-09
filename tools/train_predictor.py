@@ -250,24 +250,29 @@ def fetch_extra_data(ts_code):
 
 
 def fetch_hsgt_data():
-    """Fetch 北向/南向 资金 (market-wide, one call)"""
+    """Fetch 北向/南向 资金 (market-wide, paginated by year)"""
     cache_path = CACHE_DIR / "hsgt_flow.json"
     if cache_path.exists() and (time.time() - cache_path.stat().st_mtime < 86400 * 7):
         try:
-            return json.loads(cache_path.read_text())
+            data = json.loads(cache_path.read_text())
+            if len(data) > 500:  # ensure full data, not partial
+                return data
         except:
             pass
     result = {}
-    try:
-        df = pro.moneyflow_hsgt(start_date="20220101")
-        if df is not None and not df.empty:
-            for _, r in df.iterrows():
-                result[r["trade_date"]] = {
-                    "hgt": float(r.get("hgt", 0) or 0),  # 沪股通 (百万)
-                    "sgt": float(r.get("sgt", 0) or 0),  # 深股通 (百万)
-                }
-    except:
-        pass
+    # API returns max ~300 rows per call, fetch by year
+    for year in range(2022, 2027):
+        try:
+            df = pro.moneyflow_hsgt(start_date=f"{year}0101", end_date=f"{year}1231")
+            if df is not None and not df.empty:
+                for _, r in df.iterrows():
+                    result[r["trade_date"]] = {
+                        "hgt": float(r.get("hgt", 0) or 0),
+                        "sgt": float(r.get("sgt", 0) or 0),
+                    }
+            time.sleep(0.3)
+        except:
+            pass
     if result:
         cache_path.write_text(json.dumps(result))
     return result
@@ -285,7 +290,7 @@ def collect_data():
             result = {}
             for split in ["train", "val", "test"]:
                 result[f"X_{split}"] = np.load(SPLIT_DIR / f"X_{split}.npy", mmap_mode='r')
-                result[f"y_{split}"] = {h: np.load(SPLIT_DIR / f"y_{split}_{h}d.npy", mmap_mode='r') for h in [1,3,5]}
+                result[f"y_{split}"] = {1: np.load(SPLIT_DIR / f"y_{split}_1d.npy", mmap_mode='r')}
             log(f"Loaded: train={len(result['X_train'])}, val={len(result['X_val'])}, test={len(result['X_test'])}")
             return result
 
@@ -326,8 +331,6 @@ def collect_data():
         writers[split] = {
             "X": open(SPLIT_DIR / f"X_{split}.bin", write_mode),
             "y1": open(SPLIT_DIR / f"y1_{split}.bin", write_mode),
-            "y3": open(SPLIT_DIR / f"y3_{split}.bin", write_mode),
-            "y5": open(SPLIT_DIR / f"y5_{split}.bin", write_mode),
         }
 
     # Fetch market-wide features for ALL three major indices
@@ -368,6 +371,11 @@ def collect_data():
             return all_market_features.get("399001.SZ", {})
         else:
             return all_market_features.get("000001.SH", {})
+
+    # ── HSGT (北向/南向资金) ──
+    log("Fetching HSGT (northbound/southbound) flow data...")
+    hsgt_flow = fetch_hsgt_data()
+    log(f"  HSGT: {len(hsgt_flow)} days")
 
     # ── 申万行业指数 (板块涨跌, 31 sectors) ──
     log("Fetching SW industry index data (31 sectors)...")
@@ -451,8 +459,6 @@ def collect_data():
                 for fname, expected in [
                     (f"X_{split}.bin", expected_X),
                     (f"y1_{split}.bin", expected_y),
-                    (f"y3_{split}.bin", expected_y),
-                    (f"y5_{split}.bin", expected_y),
                 ]:
                     fpath = SPLIT_DIR / fname
                     if fpath.exists():
@@ -537,12 +543,13 @@ def collect_data():
             sw_sector_name = sw_stock_map.get(ts_code, "")
             sector_daily = sw_data.get(sw_sector_name, {})
             X = _feature_engineer(prices, market_data=stock_market, industry=stock_industry,
-                                  extra_data=extra_data, sector_data=sector_daily)
+                                  extra_data=extra_data, hsgt_data=hsgt_flow,
+                                  sector_data=sector_daily)
             if X.size == 0 or len(X) < 60:
                 errors += 1
                 continue
 
-            y = _create_labels(prices)
+            y = _create_labels(prices, horizons=[1])
             # _build_sequences returns (X_seq, y_seq, valid_indices)
             # valid_indices[k] = the price index for sequence k's label
             # This correctly handles NaN-skipped samples
@@ -574,8 +581,6 @@ def collect_data():
                 X_split = X_seq[mask]  # already float32 from _build_sequences
                 writers[split]["X"].write(X_split.tobytes())
                 writers[split]["y1"].write(y_seq[1][mask].astype(np.float32).tobytes())
-                writers[split]["y3"].write(y_seq[3][mask].astype(np.float32).tobytes())
-                writers[split]["y5"].write(y_seq[5][mask].astype(np.float32).tobytes())
                 counts[split] += int(mask.sum())
 
             # Flush ALL writers after EVERY stock — X and y stay in sync on disk
@@ -626,15 +631,13 @@ def collect_data():
         np.save(SPLIT_DIR / f"X_{split}.npy", X_arr)
         del X_raw, X_arr
 
-        # y: (count,) each
-        for h, name in [(1, "y1"), (3, "y3"), (5, "y5")]:
-            y_raw = np.fromfile(SPLIT_DIR / f"{name}_{split}.bin", dtype=np.float32)
-            np.save(SPLIT_DIR / f"y_{split}_{h}d.npy", y_raw)
-            del y_raw
+        # y: (count,)
+        y_raw = np.fromfile(SPLIT_DIR / f"y1_{split}.bin", dtype=np.float32)
+        np.save(SPLIT_DIR / f"y_{split}_1d.npy", y_raw)
+        del y_raw
 
         # Clean up .bin files
-        for f in (SPLIT_DIR / f"X_{split}.bin", SPLIT_DIR / f"y1_{split}.bin",
-                  SPLIT_DIR / f"y3_{split}.bin", SPLIT_DIR / f"y5_{split}.bin"):
+        for f in (SPLIT_DIR / f"X_{split}.bin", SPLIT_DIR / f"y1_{split}.bin"):
             f.unlink(missing_ok=True)
 
         log(f"  {split}: {c} sequences saved as .npy")
@@ -648,10 +651,73 @@ def collect_data():
     result = {}
     for split in ["train", "val", "test"]:
         result[f"X_{split}"] = np.load(SPLIT_DIR / f"X_{split}.npy", mmap_mode='r')
-        result[f"y_{split}"] = {h: np.load(SPLIT_DIR / f"y_{split}_{h}d.npy", mmap_mode='r') for h in [1,3,5]}
+        result[f"y_{split}"] = {1: np.load(SPLIT_DIR / f"y_{split}_1d.npy", mmap_mode='r')}
 
     du = sum(f.stat().st_size for f in SPLIT_DIR.iterdir() if f.suffix == '.npy')
     log(f"Data ready! Disk: {du/1e9:.1f} GB")
+
+    # ============================================================
+    # DATA INTEGRITY CHECK — must pass before training starts
+    # ============================================================
+    log("=" * 60)
+    log("DATA INTEGRITY CHECK")
+    log("=" * 60)
+    checks_passed = True
+
+    for split in ["train", "val", "test"]:
+        X = result[f"X_{split}"]
+        y1 = result[f"y_{split}"][1]
+
+        # 1. Shape alignment
+        if X.shape[0] != len(y1):
+            log(f"  ❌ {split}: shape mismatch X={X.shape[0]} y1={len(y1)}")
+            checks_passed = False
+        else:
+            log(f"  ✅ {split}: {X.shape[0]:,} samples, shape {X.shape}")
+
+        # 2. Feature dimension
+        if X.shape[2] != feature_dim:
+            log(f"  ❌ {split}: feature_dim={X.shape[2]}, expected {feature_dim}")
+            checks_passed = False
+
+        # 3. NaN/Inf check (sample 1000)
+        sample_idx = np.random.choice(X.shape[0], min(1000, X.shape[0]), replace=False)
+        X_sample = np.array(X[sample_idx])
+        if np.isnan(X_sample).any() or np.isinf(X_sample).any():
+            nan_pct = np.isnan(X_sample).mean() * 100
+            inf_pct = np.isinf(X_sample).mean() * 100
+            log(f"  ❌ {split}: NaN={nan_pct:.2f}% Inf={inf_pct:.2f}%")
+            checks_passed = False
+        else:
+            log(f"  ✅ {split}: no NaN/Inf (sampled 1000)")
+
+        # 4. Label distribution (1d only)
+        y1_arr = np.array(y1)
+        y1_real = y1_arr[y1_arr != 0.5]
+        y1_up = np.mean(y1_real) if len(y1_real) > 0 else 0
+        log(f"  ℹ️  {split}: 1d_up={y1_up:.3f}, valid={len(y1_real)}/{len(y1_arr)} ({len(y1_real)/max(len(y1_arr),1)*100:.1f}%)")
+
+        # 5. Minimum samples
+        if X.shape[0] < 1000:
+            log(f"  ❌ {split}: only {X.shape[0]} samples, need ≥1000")
+            checks_passed = False
+
+    # 6. Split ratio sanity
+    total = sum(result[f"X_{s}"].shape[0] for s in ["train", "val", "test"])
+    for s in ["train", "val", "test"]:
+        pct = result[f"X_{s}"].shape[0] / total * 100
+        log(f"  ℹ️  {s}: {pct:.1f}%")
+
+    # 7. Feature range check (expect mostly in [-4, 4] after z-score)
+    X_tr_sample = np.array(result["X_train"][np.random.choice(result["X_train"].shape[0], 500, replace=False)])
+    out_of_range = np.mean(np.abs(X_tr_sample) > 4) * 100
+    log(f"  ℹ️  train features outside ±4: {out_of_range:.1f}% (constant features expected)")
+
+    if not checks_passed:
+        log("❌ DATA CHECK FAILED — aborting training")
+        raise RuntimeError("Data integrity check failed")
+    log("✅ ALL CHECKS PASSED — proceeding to training")
+    log("=" * 60)
 
     return result
 
@@ -688,83 +754,73 @@ def train(data, max_hours=72, seed=42, model_id=0):
     seq_len = X_train.shape[1]
     log(f"Train: {n_train}, Val: {len(X_val)}, Test: {len(X_test)}, Features: {input_dim}")
 
-    # Label smoothing (reduced - labels are now clean after threshold filtering)
-    smooth = 0.03
+    # V3: 1d-only, smaller model, stronger regularization
+    # Evidence from V2.6: 3d/5d ≈ random, best epoch=2, 1.2M params overfit fast
+    smooth = 0.1  # stronger label smoothing (was 0.03)
 
-    # Custom dataset - reads from mmap on-the-fly
+    # Custom dataset - 1d only
     class MmapDataset(torch.utils.data.Dataset):
-        def __init__(self, X_mmap, y1, y3, y5, smooth=0.03):
-            self.X, self.y1, self.y3, self.y5 = X_mmap, y1, y3, y5
+        def __init__(self, X_mmap, y1, smooth=0.1):
+            self.X, self.y1 = X_mmap, y1
             self.n = len(X_mmap)
-            self.smooth = smooth  # label smoothing: 0→0.03, 1→0.97
+            self.smooth = smooth
         def __len__(self):
             return self.n
         def __getitem__(self, idx):
             x = torch.from_numpy(np.array(self.X[idx], dtype=np.float32))
-            # Labels are now clean 0/1 (NaN samples already dropped)
             y1 = np.clip(float(self.y1[idx]), self.smooth, 1.0 - self.smooth)
-            y3 = np.clip(float(self.y3[idx]), self.smooth, 1.0 - self.smooth)
-            y5 = np.clip(float(self.y5[idx]), self.smooth, 1.0 - self.smooth)
-            return x, torch.tensor(y1, dtype=torch.float32), torch.tensor(y3, dtype=torch.float32), torch.tensor(y5, dtype=torch.float32)
+            return x, torch.tensor(y1, dtype=torch.float32)
 
-    # Hyperparameters
-    batch_size = min(512, max(64, int(math.sqrt(n_train))))
-    lr = 5e-5 * (batch_size / 64)  # slightly lower LR for smaller effective batch
-    wd = 1e-2
-    hidden_dim = 128
-    n_heads = 8
-    n_layers = 4
-    max_epochs = 500
-    patience = 30
+    # Hyperparameters — smaller model to match weak signal
+    batch_size = 1024
+    lr = 3e-4
+    wd = 5e-2  # strong weight decay (was 1e-2)
+    hidden_dim = 64   # was 128
+    n_heads = 4       # was 8
+    n_layers = 2      # was 4
+    lstm_layers = 1   # was 3
+    max_epochs = 200  # was 500
+    patience = 10     # was 30 (signal peaks at epoch 2-5, no point waiting 30)
 
-    # Class balance check - compute pos_weight for each horizon
-    # Filter out 0.5 fill labels when computing class balance
-    # 0.5 = NaN-filled unknowns, not real labels
+    # Class balance - 1d only
     def real_mean(arr):
         a = np.array(arr)
         real = a[a != 0.5]
         return np.mean(real) if len(real) > 0 else 0.5
     y1_mean = real_mean(y_train[1])
-    y3_mean = real_mean(y_train[3])
-    y5_mean = real_mean(y_train[5])
-    log(f"Class balance: 1d_up={y1_mean:.3f} 3d_up={y3_mean:.3f} 5d_up={y5_mean:.3f}")
-
-    # If imbalanced, Focal Loss alpha should compensate
-    # alpha = 1 - pos_ratio (give more weight to minority class)
+    log(f"Class balance: 1d_up={y1_mean:.3f}")
     focal_alpha_1d = 1.0 - y1_mean
-    focal_alpha_3d = 1.0 - y3_mean
-    focal_alpha_5d = 1.0 - y5_mean
-    log(f"Focal alpha: 1d={focal_alpha_1d:.3f} 3d={focal_alpha_3d:.3f} 5d={focal_alpha_5d:.3f}")
+    log(f"Focal alpha: 1d={focal_alpha_1d:.3f}")
     log(f"Batch size: {batch_size}, LR: {lr:.6f}, Weight decay: {wd}")
+    log(f"Model: hidden={hidden_dim}, heads={n_heads}, layers={n_layers}, lstm={lstm_layers}")
 
-    train_ds = MmapDataset(X_train, y_train[1], y_train[3], y_train[5], smooth=smooth)
+    train_ds = MmapDataset(X_train, y_train[1], smooth=smooth)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=0)
 
     steps_per_epoch = len(train_loader)
     log(f"Batches/epoch: {steps_per_epoch}")
 
-    # Model
+    # Model — V3: smaller, 1d-only, stronger dropout
     class HybridModel(nn.Module):
         def __init__(self):
             super().__init__()
             self.input_proj = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(), nn.Dropout(0.1))
-            self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True, num_layers=3, dropout=0.3)
+                nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(), nn.Dropout(0.2))
+            self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True,
+                                num_layers=lstm_layers, dropout=0.0)  # 1 layer = no internal dropout
             self.lstm_norm = nn.LayerNorm(hidden_dim)
             self.pos_enc = nn.Parameter(torch.randn(1, seq_len, hidden_dim) * 0.02)
             enc_layer = nn.TransformerEncoderLayer(
                 d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim*4,
-                dropout=0.3, batch_first=True, activation='gelu')
+                dropout=0.4, batch_first=True, activation='gelu')  # dropout 0.3→0.4
             self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
             self.out_norm = nn.LayerNorm(hidden_dim)
             self.attn_pool = nn.Linear(hidden_dim, 1)
-            # Shared trunk - captures common patterns across horizons
-            self.shared_fc = nn.Sequential(
-                nn.Linear(hidden_dim, 64), nn.GELU(), nn.Dropout(0.3))
-            # Separate thin heads - horizon-specific
-            self.head_1d = nn.Sequential(nn.Linear(64, 16), nn.GELU(), nn.Linear(16, 1), nn.Sigmoid())
-            self.head_3d = nn.Sequential(nn.Linear(64, 16), nn.GELU(), nn.Linear(16, 1), nn.Sigmoid())
-            self.head_5d = nn.Sequential(nn.Linear(64, 16), nn.GELU(), nn.Linear(16, 1), nn.Sigmoid())
+            # Single head — 1d prediction only
+            self.head = nn.Sequential(
+                nn.Dropout(0.5),  # aggressive dropout before final head
+                nn.Linear(hidden_dim, 16), nn.GELU(),
+                nn.Linear(16, 1), nn.Sigmoid())
 
         def forward(self, x):
             x = self.input_proj(x)
@@ -773,8 +829,7 @@ def train(data, max_hours=72, seed=42, model_id=0):
             t = self.out_norm(self.transformer(h))
             w = torch.softmax(self.attn_pool(t), dim=1)
             p = (t * w).sum(dim=1)
-            shared = self.shared_fc(p)  # shared representation
-            return self.head_1d(shared), self.head_3d(shared), self.head_5d(shared)
+            return self.head(p)
 
     model = HybridModel().to(device)
     total_params = sum(p.numel() for p in model.parameters())
@@ -818,17 +873,15 @@ def train(data, max_hours=72, seed=42, model_id=0):
             focal = torch.where(fp_mask, focal * self.fp_penalty, focal)
             return focal.mean()
 
-    criterion_1d = AsymmetricFocalBCE(gamma=1.5, alpha=focal_alpha_1d, fp_penalty=1.3)
-    criterion_3d = AsymmetricFocalBCE(gamma=1.5, alpha=focal_alpha_3d, fp_penalty=1.3)
-    criterion_5d = AsymmetricFocalBCE(gamma=1.5, alpha=focal_alpha_5d, fp_penalty=1.3)
+    criterion = AsymmetricFocalBCE(gamma=1.5, alpha=focal_alpha_1d, fp_penalty=1.3)
 
-    # Gradient accumulation - effective batch size = batch_size * accum_steps
-    accum_steps = 2  # effective batch = 512*2 = 1024
-    log(f"Gradient accumulation: {accum_steps} steps (effective batch={batch_size*accum_steps})")
+    # No gradient accumulation — batch_size=1024 is already large enough
+    accum_steps = 1
+    log(f"Effective batch size: {batch_size}")
 
-    # SWA
+    # SWA — start early enough to activate before patience kicks in
     swa_model = torch.optim.swa_utils.AveragedModel(model)
-    swa_start = 30
+    swa_start = 7
     swa_active = False
 
     best_val_loss = float('inf')
@@ -837,8 +890,8 @@ def train(data, max_hours=72, seed=42, model_id=0):
     no_improve = 0
     start_time = time.time()
 
-    history = {"train_loss": [], "val_loss": [], "val_acc_1d": [], "val_acc_3d": [],
-               "val_acc_5d": [], "learning_rate": [], "grad_norm": [], "epoch_time": []}
+    history = {"train_loss": [], "val_loss": [], "val_acc_1d": [],
+               "learning_rate": [], "grad_norm": [], "epoch_time": []}
 
     suffix = f"_{model_id}" if model_id > 0 else ""
     checkpoint_path = MODEL_DIR / f"predictor_best{suffix}.pt"
@@ -860,31 +913,15 @@ def train(data, max_hours=72, seed=42, model_id=0):
         grad_norms = []
 
         optimizer.zero_grad()
-        for batch_idx, (bx, by1, by3, by5) in enumerate(train_loader):
+        for batch_idx, (bx, by1) in enumerate(train_loader):
             bx = bx.to(device)
-            by1, by3, by5 = by1.to(device), by3.to(device), by5.to(device)
+            by1 = by1.to(device)
 
-            # Data augmentation after warmup — light touch for financial data
-            # Only apply ONE augmentation per batch (not all three stacked)
-            if epoch > 3 and random.random() < 0.5:  # 50% of batches get augmented
-                aug_type = random.random()
-                if aug_type < 0.5:
-                    # Gaussian noise (reduced from 0.003 to 0.001)
-                    bx = bx + torch.randn_like(bx) * 0.001
-                elif aug_type < 0.8:
-                    # Feature masking (reduced from 10% to 5%)
-                    mask = torch.ones(bx.shape[2], device=device)
-                    mask[torch.rand(bx.shape[2], device='cpu') < 0.05] = 0
-                    bx = bx * mask.unsqueeze(0).unsqueeze(0)
-                else:
-                    # Magnitude scaling (reduced from ±5% to ±2%)
-                    bx = bx * (1.0 + (random.random() - 0.5) * 0.04)
+            # No data augmentation — V2.6 showed signal is too weak, augmentation adds noise
 
-            p1, p3, p5 = model(bx)
-            # Weight 1d heavier — it's the most actionable prediction
-            loss = 0.5 * criterion_1d(p1.squeeze(), by1) + 0.3 * criterion_3d(p3.squeeze(), by3) + 0.2 * criterion_5d(p5.squeeze(), by5)
-            # Scale loss by accumulation steps
-            (loss / accum_steps).backward()
+            pred = model(bx)
+            loss = criterion(pred.squeeze(), by1)
+            loss.backward()
 
             train_loss += loss.item()
             n_batches += 1
@@ -908,48 +945,36 @@ def train(data, max_hours=72, seed=42, model_id=0):
         else:
             scheduler.step(epoch - warmup_epochs)
 
-        # Validation (batched from mmap)
+        # Validation (batched from mmap) — 1d only
         model.eval()
-        val_n = len(X_val)  # use ALL val data for honest early stopping
+        val_n = len(X_val)
         val_loss_sum, val_count = 0, 0
-        vp1_all, vp3_all, vp5_all = [], [], []
-        vy1_all, vy3_all, vy5_all = [], [], []
+        vp1_all, vy1_all = [], []
 
         with torch.no_grad():
-            for vs in range(0, val_n, 512):
-                ve = min(vs + 512, val_n)
+            for vs in range(0, val_n, 1024):
+                ve = min(vs + 1024, val_n)
                 xb = torch.FloatTensor(np.array(X_val[vs:ve])).to(device)
-                # Use TRUE labels for val (no smoothing - we want honest metrics)
                 y1b = torch.FloatTensor(np.array(y_val[1][vs:ve])).to(device)
-                y3b = torch.FloatTensor(np.array(y_val[3][vs:ve])).to(device)
-                y5b = torch.FloatTensor(np.array(y_val[5][vs:ve])).to(device)
 
-                p1, p3, p5 = model(xb)
-                vl = 0.5 * criterion_1d(p1.squeeze(), y1b) + 0.3 * criterion_3d(p3.squeeze(), y3b) + 0.2 * criterion_5d(p5.squeeze(), y5b)
+                pred = model(xb)
+                vl = criterion(pred.squeeze(), y1b)
                 val_loss_sum += vl.item() * (ve - vs)
                 val_count += (ve - vs)
 
-                vp1_all.append(p1.squeeze().cpu())
-                vp3_all.append(p3.squeeze().cpu())
-                vp5_all.append(p5.squeeze().cpu())
+                vp1_all.append(pred.squeeze().cpu())
                 vy1_all.append(torch.FloatTensor(np.array(y_val[1][vs:ve])))
-                vy3_all.append(torch.FloatTensor(np.array(y_val[3][vs:ve])))
-                vy5_all.append(torch.FloatTensor(np.array(y_val[5][vs:ve])))
 
         val_loss = val_loss_sum / max(val_count, 1)
-        vp1 = torch.cat(vp1_all); vp3 = torch.cat(vp3_all); vp5 = torch.cat(vp5_all)
-        vy1 = torch.cat(vy1_all); vy3 = torch.cat(vy3_all); vy5 = torch.cat(vy5_all)
-        # Only count accuracy on REAL labels (exclude 0.5 fill values)
-        # y=0.5 are NaN-filled samples that would always count as wrong
+        vp1 = torch.cat(vp1_all)
+        vy1 = torch.cat(vy1_all)
         def masked_acc(pred, target):
-            valid = (target != 0.5)  # 0.5 = NaN-filled, not a real label
+            valid = (target != 0.5)
             if valid.sum() == 0:
                 return 0.5
             return ((pred[valid] > 0.5).float() == target[valid]).float().mean().item()
         acc1 = masked_acc(vp1, vy1)
-        acc3 = masked_acc(vp3, vy3)
-        acc5 = masked_acc(vp5, vy5)
-        avg_acc = (acc1 + acc3 + acc5) / 3
+        avg_acc = acc1
 
         epoch_time = time.time() - epoch_start
         lr_now = optimizer.param_groups[0]['lr']
@@ -958,14 +983,11 @@ def train(data, max_hours=72, seed=42, model_id=0):
         history["train_loss"].append(round(train_loss, 6))
         history["val_loss"].append(round(val_loss, 6))
         history["val_acc_1d"].append(round(acc1*100, 2))
-        history["val_acc_3d"].append(round(acc3*100, 2))
-        history["val_acc_5d"].append(round(acc5*100, 2))
         history["learning_rate"].append(round(lr_now, 8))
         history["grad_norm"].append(round(avg_gn, 4))
         history["epoch_time"].append(round(epoch_time, 2))
 
-        if (epoch + 1) % 10 == 0:
-            loss_curve_path.write_text(json.dumps(history, indent=2))
+        loss_curve_path.write_text(json.dumps(history, indent=2))
 
         # Best check - use val_loss ONLY for early stopping (single metric, no ambiguity)
         # best_val_acc tracks accuracy AT the best val_loss epoch (not global max)
@@ -980,9 +1002,9 @@ def train(data, max_hours=72, seed=42, model_id=0):
             torch.save(best_state, checkpoint_path)
             meta = {
                 "epoch": epoch + 1, "val_loss": round(val_loss, 4), "train_loss": round(train_loss, 4),
-                "accuracy_1d": round(acc1*100, 1), "accuracy_3d": round(acc3*100, 1), "accuracy_5d": round(acc5*100, 1),
+                "accuracy_1d": round(acc1*100, 1),
                 "avg_accuracy": round(avg_acc*100, 1), "total_params": total_params, "hidden_dim": hidden_dim,
-                "n_heads": n_heads, "n_layers": n_layers, "lstm_layers": 3, "input_dim": input_dim, "seq_len": seq_len,
+                "n_heads": n_heads, "n_layers": n_layers, "lstm_layers": lstm_layers, "input_dim": input_dim, "seq_len": seq_len,
                 "train_size": n_train, "val_size": len(X_val), "batch_size": batch_size,
                 "learning_rate": lr, "elapsed_hours": round(elapsed/3600, 2), "timestamp": int(time.time()),
             }
@@ -990,10 +1012,9 @@ def train(data, max_hours=72, seed=42, model_id=0):
         else:
             no_improve += 1
 
-        if (epoch + 1) % 5 == 0 or improved:
-            log(f"Epoch {epoch+1:3d} | train={train_loss:.4f} val={val_loss:.4f} gap={gap:+.4f} | "
-                f"acc: 1d={acc1*100:.1f}% 3d={acc3*100:.1f}% 5d={acc5*100:.1f}% | "
-                f"grad={avg_gn:.3f} lr={lr_now:.2e} | {epoch_time:.1f}s | {'★' if improved else ''}")
+        log(f"Epoch {epoch+1:3d} | train={train_loss:.4f} val={val_loss:.4f} gap={gap:+.4f} | "
+            f"acc: 1d={acc1*100:.1f}% | "
+            f"grad={avg_gn:.3f} lr={lr_now:.2e} | {epoch_time:.1f}s | {'★' if improved else ''}")
 
         # SWA
         if epoch >= swa_start:
@@ -1015,26 +1036,25 @@ def train(data, max_hours=72, seed=42, model_id=0):
         torch.optim.swa_utils.update_bn(train_loader, swa_model, device=device)
         swa_model.eval()
         # Batched SWA evaluation (full val, avoid OOM)
-        swa_correct = {h: 0 for h in [1,3,5]}
-        swa_valid_count = {h: 0 for h in [1,3,5]}
+        swa_correct, swa_valid_count = 0, 0
         with torch.no_grad():
-            for vs in range(0, len(X_val), 512):
-                ve = min(vs + 512, len(X_val))
+            for vs in range(0, len(X_val), 1024):
+                ve = min(vs + 1024, len(X_val))
                 xb = torch.FloatTensor(np.array(X_val[vs:ve])).to(device)
-                sp1, sp3, sp5 = swa_model(xb)
-                yb = {h: torch.FloatTensor(np.array(y_val[h][vs:ve])) for h in [1,3,5]}
-                for sp, h in [(sp1,1),(sp3,3),(sp5,5)]:
-                    valid = (yb[h] != 0.5)
-                    if valid.sum() > 0:
-                        swa_correct[h] += ((sp.squeeze().cpu()[valid] > 0.5).float() == yb[h][valid]).float().sum().item()
-                        swa_valid_count[h] += valid.sum().item()
-        swa_avg = sum(swa_correct[h] / max(swa_valid_count[h], 1) for h in [1,3,5]) / 3
+                sp = swa_model(xb)
+                yb = torch.FloatTensor(np.array(y_val[1][vs:ve]))
+                valid = (yb != 0.5)
+                if valid.sum() > 0:
+                    swa_correct += ((sp.squeeze().cpu()[valid] > 0.5).float() == yb[valid]).float().sum().item()
+                    swa_valid_count += valid.sum().item()
+        swa_avg = swa_correct / max(swa_valid_count, 1)
         log(f"SWA avg_acc={swa_avg*100:.1f}% vs best={best_val_acc*100:.1f}%")
         if swa_avg > best_val_acc:
             log("★ SWA wins!")
-            # SWA state_dict has 'module.' prefix — strip it for compatibility
+            # SWA state_dict has 'module.' prefix and extra keys like 'n_averaged'
             best_state = {k.replace("module.", ""): v.cpu().clone()
-                          for k, v in swa_model.state_dict().items()}
+                          for k, v in swa_model.state_dict().items()
+                          if not k.startswith("n_averaged")}
             model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
 
     torch.save(best_state, checkpoint_path)
@@ -1048,24 +1068,18 @@ def train(data, max_hours=72, seed=42, model_id=0):
     log("=" * 60)
 
     model.eval()
-    test_n = len(X_test)  # eval ALL test samples - no cap
-    tp1_all, tp3_all, tp5_all = [], [], []
+    test_n = len(X_test)
+    tp1_all = []
 
     with torch.no_grad():
-        for ts in range(0, test_n, 512):
-            te = min(ts + 512, test_n)
+        for ts in range(0, test_n, 1024):
+            te = min(ts + 1024, test_n)
             xb = torch.FloatTensor(np.array(X_test[ts:te])).to(device)
-            p1, p3, p5 = model(xb)
-            tp1_all.append(p1.squeeze().cpu())
-            tp3_all.append(p3.squeeze().cpu())
-            tp5_all.append(p5.squeeze().cpu())
+            pred = model(xb)
+            tp1_all.append(pred.squeeze().cpu())
 
     tp1 = torch.cat(tp1_all).numpy()
-    tp3 = torch.cat(tp3_all).numpy()
-    tp5 = torch.cat(tp5_all).numpy()
     ty1 = np.array(y_test[1][:test_n])
-    ty3 = np.array(y_test[3][:test_n])
-    ty5 = np.array(y_test[5][:test_n])
 
     def np_masked_acc(pred, target):
         valid = (target != 0.5)
@@ -1073,18 +1087,12 @@ def train(data, max_hours=72, seed=42, model_id=0):
             return 0.5
         return np.mean((pred[valid] > 0.5) == target[valid])
     test_acc1 = np_masked_acc(tp1, ty1)
-    test_acc3 = np_masked_acc(tp3, ty3)
-    test_acc5 = np_masked_acc(tp5, ty5)
-    test_avg = (test_acc1 + test_acc3 + test_acc5) / 3
+    test_avg = test_acc1
 
-    log(f"Test Accuracy:")
-    log(f"  1-day: {test_acc1*100:.1f}%")
-    log(f"  3-day: {test_acc3*100:.1f}%")
-    log(f"  5-day: {test_acc5*100:.1f}%")
-    log(f"  Average: {test_avg*100:.1f}%")
+    log(f"Test Accuracy: 1-day={test_acc1*100:.1f}%")
 
-    # Detailed analysis per horizon
-    for name, preds, labels in [("1-day", tp1, ty1), ("3-day", tp3, ty3), ("5-day", tp5, ty5)]:
+    # Detailed analysis
+    for name, preds, labels in [("1-day", tp1, ty1)]:
         pred_bin = (preds > 0.5).astype(float)
         tp = np.sum((pred_bin == 1) & (labels == 1))
         fp = np.sum((pred_bin == 1) & (labels == 0))
@@ -1111,11 +1119,8 @@ def train(data, max_hours=72, seed=42, model_id=0):
 
     # Calibration
     log(f"")
-    # Calibration (exclude 0.5 fills for 3d/5d)
+    # Calibration
     log(f"Calibration: pred_up_1d={tp1.mean():.3f} actual={ty1.mean():.3f}")
-    ty3_real = ty3[ty3 != 0.5]; ty5_real = ty5[ty5 != 0.5]
-    log(f"Calibration: pred_up_3d={tp3[ty3 != 0.5].mean():.3f} actual={ty3_real.mean():.3f}")
-    log(f"Calibration: pred_up_5d={tp5[ty5 != 0.5].mean():.3f} actual={ty5_real.mean():.3f}")
 
     # Overfitting check
     gap = best_val_acc * 100 - test_avg * 100
@@ -1137,8 +1142,6 @@ def train(data, max_hours=72, seed=42, model_id=0):
     # Update meta
     meta = json.loads(meta_path.read_text())
     meta["test_accuracy_1d"] = round(test_acc1*100, 1)
-    meta["test_accuracy_3d"] = round(test_acc3*100, 1)
-    meta["test_accuracy_5d"] = round(test_acc5*100, 1)
     meta["test_avg_accuracy"] = round(test_avg*100, 1)
     meta["overfit_gap"] = round(gap, 1)
     meta_path.write_text(json.dumps(meta, indent=2))
@@ -1178,7 +1181,7 @@ def train_ensemble(data, n_models=3, max_hours_per_model=24):
 
 if __name__ == "__main__":
     log("=" * 60)
-    log("Stock Price Predictor - Large-Scale Training V2")
+    log("Stock Price Predictor - Large-Scale Training V3 (1d-only)")
     log("=" * 60)
     data = collect_data()
     # Train 3 models for ensemble (8h each max = 24h total max)

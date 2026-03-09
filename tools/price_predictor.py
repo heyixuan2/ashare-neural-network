@@ -1,12 +1,11 @@
 """
-Stock Price Direction Predictor — LSTM + Transformer
-Predicts probability of price going UP in next 1/3/5 days.
+Stock Price Direction Predictor — LSTM + Transformer (V3, 1d-only)
+Predicts probability of price going UP in the next trading day.
 
 Architecture:
-- Feature engineering: 30+ technical features from OHLCV
-- Model: LSTM encoder → Transformer encoder → FC classifier
-- Output: P(up) for 1-day, 3-day, 5-day horizons
-- Training: 2 years history, last 60 days as test
+- Feature engineering: 51 features (technical + fundamental + market-wide)
+- Model: LSTM(1 layer) → Transformer(2 layers, 4 heads) → single head
+- Output: P(up) for 1-day horizon
 """
 import os
 import json
@@ -216,6 +215,8 @@ def _feature_engineer(prices: list, market_data: dict = None, industry: str = No
         # Relative strength: stock return vs market return
         rel_strength = ret1 - idx_ret
         features.append(rel_strength)
+    else:
+        features.extend([np.zeros(n), np.zeros(n)])
 
     # ── Extra features from daily_basic + moneyflow ──
     if extra_data:
@@ -281,6 +282,21 @@ def _feature_engineer(prices: list, market_data: dict = None, industry: str = No
                 sector_ret[i] = sector_data[date]
                 sector_vs_stock[i] = ret1[i] - sector_data[date]
         features.extend([sector_ret, sector_vs_stock])
+    else:
+        features.extend([np.zeros(n), np.zeros(n)])
+
+    # ── HSGT (北向资金 / 南向资金) ──
+    if hsgt_data:
+        north_flow = np.zeros(n)  # 沪股通 + 深股通 (百万)
+        for i, p in enumerate(prices):
+            date = p.get("date", "")
+            if date in hsgt_data:
+                north_flow[i] = hsgt_data[date].get("hgt", 0) + hsgt_data[date].get("sgt", 0)
+        # 5-day MA ratio: today's flow vs recent average (captures flow momentum)
+        nf_ma5 = np.convolve(north_flow, np.ones(5)/5, mode='full')[:n]
+        nf_ma5[:4] = nf_ma5[4]
+        nf_ratio = north_flow / np.maximum(np.abs(nf_ma5), 1.0)
+        features.extend([north_flow, nf_ratio])
     else:
         features.extend([np.zeros(n), np.zeros(n)])
 
@@ -413,17 +429,18 @@ def _build_sequences(X: np.ndarray, y: Dict[int, np.ndarray], seq_len=30, norm_w
 
 
 class StockPredictor:
-    """LSTM + Transformer hybrid model for stock prediction
+    """LSTM + Transformer hybrid model for stock prediction — V3 (1d-only)
 
     Architecture must match train_predictor.py HybridModel exactly:
-    - InputProj(input_dim→128) → LSTM(3 layers, 128) → Transformer(4 layers, 8 heads, ff=512)
-    - AttentionPooling → SharedFC(128→64) → 3 thin heads (64→16→1)
+    - InputProj(input_dim→64, dropout=0.2) → LSTM(1 layer, 64)
+    - Transformer(2 layers, 4 heads, ff=256, dropout=0.4)
+    - AttentionPooling → Dropout(0.5) → head (64→16→1)
     """
 
-    # Default architecture matches train_predictor.py
-    TRAIN_ARCH = {"hidden_dim": 128, "n_heads": 8, "n_layers": 4, "lstm_layers": 3}
+    # Default architecture matches V3 train_predictor.py
+    TRAIN_ARCH = {"hidden_dim": 64, "n_heads": 4, "n_layers": 2, "lstm_layers": 1}
 
-    def __init__(self, input_dim, seq_len=30, hidden_dim=128, n_heads=8, n_layers=4, lstm_layers=3):
+    def __init__(self, input_dim, seq_len=30, hidden_dim=64, n_heads=4, n_layers=2, lstm_layers=1):
         import torch
         import torch.nn as nn
 
@@ -431,32 +448,31 @@ class StockPredictor:
         self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
         class HybridModel(nn.Module):
-            def __init__(self, input_dim, hidden_dim, n_heads, n_layers, lstm_layers=3):
+            def __init__(self, input_dim, hidden_dim, n_heads, n_layers, lstm_layers=1):
                 super().__init__()
                 self.input_proj = nn.Sequential(
                     nn.Linear(input_dim, hidden_dim),
                     nn.LayerNorm(hidden_dim),
                     nn.GELU(),
-                    nn.Dropout(0.1),
+                    nn.Dropout(0.2),
                 )
                 self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True,
-                                     num_layers=lstm_layers, dropout=0.3)
+                                     num_layers=lstm_layers, dropout=0.0)
                 self.lstm_norm = nn.LayerNorm(hidden_dim)
                 self.pos_enc = nn.Parameter(torch.randn(1, seq_len, hidden_dim) * 0.02)
                 enc_layer = nn.TransformerEncoderLayer(
                     d_model=hidden_dim, nhead=n_heads,
-                    dim_feedforward=hidden_dim*4, dropout=0.3,
+                    dim_feedforward=hidden_dim*4, dropout=0.4,
                     batch_first=True, activation='gelu'
                 )
                 self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
                 self.out_norm = nn.LayerNorm(hidden_dim)
                 self.attn_pool = nn.Linear(hidden_dim, 1)
-                # Shared trunk + thin heads — matches train_predictor.py exactly
-                self.shared_fc = nn.Sequential(
-                    nn.Linear(hidden_dim, 64), nn.GELU(), nn.Dropout(0.3))
-                self.head_1d = nn.Sequential(nn.Linear(64, 16), nn.GELU(), nn.Linear(16, 1), nn.Sigmoid())
-                self.head_3d = nn.Sequential(nn.Linear(64, 16), nn.GELU(), nn.Linear(16, 1), nn.Sigmoid())
-                self.head_5d = nn.Sequential(nn.Linear(64, 16), nn.GELU(), nn.Linear(16, 1), nn.Sigmoid())
+                # Single head — 1d prediction only
+                self.head = nn.Sequential(
+                    nn.Dropout(0.5),
+                    nn.Linear(hidden_dim, 16), nn.GELU(),
+                    nn.Linear(16, 1), nn.Sigmoid())
 
             def forward(self, x):
                 x = self.input_proj(x)
@@ -465,8 +481,7 @@ class StockPredictor:
                 t = self.out_norm(self.transformer(h))
                 w = torch.softmax(self.attn_pool(t), dim=1)
                 p = (t * w).sum(dim=1)
-                shared = self.shared_fc(p)
-                return self.head_1d(shared), self.head_3d(shared), self.head_5d(shared)
+                return self.head(p)
 
         self.model = HybridModel(input_dim, hidden_dim, n_heads, n_layers, lstm_layers).to(self.device)
 
@@ -483,7 +498,7 @@ class StockPredictor:
             hidden_dim=meta["hidden_dim"],
             n_heads=meta["n_heads"],
             n_layers=meta["n_layers"],
-            lstm_layers=meta.get("lstm_layers", 3),
+            lstm_layers=meta.get("lstm_layers", 1),
         )
         state = torch.load(model_dir / "predictor_best.pt", map_location=predictor.device, weights_only=True)
         predictor.model.load_state_dict(state)
@@ -509,7 +524,8 @@ class StockPredictor:
                 hidden_dim=meta["hidden_dim"],
                 n_heads=meta["n_heads"],
                 n_layers=meta["n_layers"],
-            )
+            lstm_layers=meta.get("lstm_layers", 1),
+        )
             state = torch.load(pt_path, map_location=p.device, weights_only=True)
             p.model.load_state_dict(state)
             p.model.eval()
@@ -527,17 +543,10 @@ class StockPredictor:
         X_train_np = X_seq[:split]
         X_val = torch.FloatTensor(X_seq[split:]).to(self.device)
 
-        y_train_np = {h: y_dict[h][:split] for h in y_dict}
-        y_val = {h: torch.FloatTensor(y_dict[h][split:]).to(self.device) for h in y_dict}
+        y1_train = np.clip(y_dict[1][:split], 0.1, 0.9)  # label smoothing
+        y1_val = torch.clamp(torch.FloatTensor(y_dict[1][split:]).to(self.device), 0.1, 0.9)
 
-        # Label smoothing: 0/1 → 0.05/0.95 (reduces overconfidence)
-        smooth = 0.05
-        for h in y_train_np:
-            y_train_np[h] = np.clip(y_train_np[h], smooth, 1.0 - smooth)
-        for h in y_val:
-            y_val[h] = torch.clamp(y_val[h], smooth, 1.0 - smooth)
-
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=5e-3)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=5e-2)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=lr, total_steps=epochs, pct_start=0.1,
             anneal_strategy='cos', final_div_factor=100
@@ -546,61 +555,36 @@ class StockPredictor:
 
         best_val_loss = float('inf')
         best_state = None
-        patience = 25
+        patience = 10
         no_improve = 0
         batch_size = 64
 
-        train_losses = []
-        val_losses = []
-
         for epoch in range(epochs):
             self.model.train()
-
-            # Mini-batch training with shuffled indices
             indices = np.random.permutation(len(X_train_np))
-            epoch_loss = 0
-            n_batches = 0
+            epoch_loss, n_batches = 0, 0
 
             for start in range(0, len(indices), batch_size):
                 batch_idx = indices[start:start+batch_size]
                 X_batch = torch.FloatTensor(X_train_np[batch_idx]).to(self.device)
-                y_batch = {h: torch.FloatTensor(y_train_np[h][batch_idx]).to(self.device) for h in y_train_np}
-
-                # Random noise augmentation (Gaussian, std=0.01)
-                if epoch > 10:
-                    noise = torch.randn_like(X_batch) * 0.005
-                    X_batch = X_batch + noise
+                y_batch = torch.FloatTensor(y1_train[batch_idx]).to(self.device)
 
                 optimizer.zero_grad()
-                p1, p3, p5 = self.model(X_batch)
-                loss = (criterion(p1.squeeze(), y_batch[1])
-                      + criterion(p3.squeeze(), y_batch[3])
-                      + criterion(p5.squeeze(), y_batch[5]))
-
-                # L2 regularization on predictions (penalize extreme confidence)
-                reg = 0.01 * (torch.mean((p1 - 0.5)**2) + torch.mean((p3 - 0.5)**2) + torch.mean((p5 - 0.5)**2))
-                (loss + reg).backward()
-
+                pred = self.model(X_batch)
+                loss = criterion(pred.squeeze(), y_batch)
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
                 optimizer.step()
                 epoch_loss += loss.item()
                 n_batches += 1
 
             scheduler.step()
-            train_loss = epoch_loss / max(n_batches, 1)
-            train_losses.append(train_loss)
 
             # Validation
             self.model.eval()
             with torch.no_grad():
-                vp1, vp3, vp5 = self.model(X_val)
-                val_loss = (criterion(vp1.squeeze(), y_val[1])
-                          + criterion(vp3.squeeze(), y_val[3])
-                          + criterion(vp5.squeeze(), y_val[5])).item()
-            val_losses.append(val_loss)
-
-            # Check overfitting gap
-            overfit_gap = train_loss - val_loss
+                vp = self.model(X_val)
+                val_loss = criterion(vp.squeeze(), y1_val).item()
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -611,54 +595,31 @@ class StockPredictor:
                 if no_improve >= patience:
                     break
 
-            # Stop if severely overfitting (train loss << val loss)
-            if epoch > 30 and len(train_losses) > 10:
-                recent_train = np.mean(train_losses[-5:])
-                recent_val = np.mean(val_losses[-5:])
-                if recent_train < recent_val * 0.6:  # train loss < 60% of val loss
-                    break
-
         if best_state:
             self.model.load_state_dict({k: v.to(self.device) for k, v in best_state.items()})
 
-        # Compute accuracy on validation set (using hard labels)
+        # Compute accuracy on validation set
         self.model.eval()
-        y_val_hard = {h: torch.FloatTensor(y_dict[h][split:]).to(self.device) for h in y_dict}
+        y1_val_hard = torch.FloatTensor(y_dict[1][split:]).to(self.device)
         with torch.no_grad():
-            vp1, vp3, vp5 = self.model(X_val)
-            acc1 = ((vp1.squeeze() > 0.5).float() == y_val_hard[1]).float().mean().item()
-            acc3 = ((vp3.squeeze() > 0.5).float() == y_val_hard[3]).float().mean().item()
-            acc5 = ((vp5.squeeze() > 0.5).float() == y_val_hard[5]).float().mean().item()
-
-        # Compute train accuracy for overfitting check
-        X_train_t = torch.FloatTensor(X_train_np).to(self.device)
-        y_train_hard = {h: torch.FloatTensor(y_dict[h][:split]).to(self.device) for h in y_dict}
-        with torch.no_grad():
-            tp1, tp3, tp5 = self.model(X_train_t)
-            train_acc1 = ((tp1.squeeze() > 0.5).float() == y_train_hard[1]).float().mean().item()
+            vp = self.model(X_val)
+            acc1 = ((vp.squeeze() > 0.5).float() == y1_val_hard).float().mean().item()
 
         return {
             "epochs_trained": epoch + 1,
             "val_loss": round(best_val_loss, 4),
-            "train_loss": round(train_losses[-1] if train_losses else 0, 4),
             "accuracy_1d": round(acc1 * 100, 1),
-            "accuracy_3d": round(acc3 * 100, 1),
-            "accuracy_5d": round(acc5 * 100, 1),
-            "train_accuracy_1d": round(train_acc1 * 100, 1),
-            "overfit_ratio": round(train_acc1 / max(acc1, 0.01), 2),
         }
 
     def predict(self, X_seq_last):
-        """Predict on the last sequence"""
+        """Predict on the last sequence — 1d only"""
         import torch
         self.model.eval()
         with torch.no_grad():
             x = torch.FloatTensor(X_seq_last).unsqueeze(0).to(self.device)
-            p1, p3, p5 = self.model(x)
+            pred = self.model(x)
             return {
-                "1d": round(p1.item() * 100, 1),
-                "3d": round(p3.item() * 100, 1),
-                "5d": round(p5.item() * 100, 1),
+                "1d": round(pred.item() * 100, 1),
             }
 
 
@@ -706,9 +667,9 @@ def predict_stock(symbol: str, prices: list) -> Dict[str, Any]:
         # NO additional normalization here — _build_sequences already does
         # rolling 60-day z-score + clip ±4. Double normalization would distort features.
 
-        # Build & train
+        # Build & train — V3: smaller model, 1d only
         input_dim = X_seq.shape[2]
-        predictor = StockPredictor(input_dim=input_dim, seq_len=seq_len, hidden_dim=96, n_heads=4, n_layers=3)
+        predictor = StockPredictor(input_dim=input_dim, seq_len=seq_len)
         metrics = predictor.train_model(X_seq, y_seq, epochs=150, lr=0.0005)
 
         # Predict
@@ -717,8 +678,6 @@ def predict_stock(symbol: str, prices: list) -> Dict[str, Any]:
         # Confidence based on how far from 50%
         confidence = {
             "1d": round(abs(probs["1d"] - 50) / 50 * 100, 1),
-            "3d": round(abs(probs["3d"] - 50) / 50 * 100, 1),
-            "5d": round(abs(probs["5d"] - 50) / 50 * 100, 1),
         }
 
         result = {
@@ -727,11 +686,9 @@ def predict_stock(symbol: str, prices: list) -> Dict[str, Any]:
             "confidence": confidence,
             "directions": {
                 "1d": "涨" if probs["1d"] > 50 else "跌",
-                "3d": "涨" if probs["3d"] > 50 else "跌",
-                "5d": "涨" if probs["5d"] > 50 else "跌",
             },
             "training": metrics,
-            "model": "LSTM-Transformer Hybrid",
+            "model": "LSTM-Transformer V3 (1d-only)",
             "features": input_dim,
             "sequences": len(X_seq),
             "timestamp": int(time.time()),

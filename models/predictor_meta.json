@@ -1,0 +1,23 @@
+{
+  "epoch": 1,
+  "val_loss": 0.1448,
+  "train_loss": 0.1202,
+  "accuracy_1d": 53.4,
+  "avg_accuracy": 53.4,
+  "total_params": 140002,
+  "hidden_dim": 64,
+  "n_heads": 4,
+  "n_layers": 2,
+  "lstm_layers": 1,
+  "input_dim": 51,
+  "seq_len": 30,
+  "train_size": 3030131,
+  "val_size": 305104,
+  "batch_size": 1024,
+  "learning_rate": 0.0003,
+  "elapsed_hours": 0.0,
+  "timestamp": 1773022129,
+  "test_accuracy_1d": 50.8,
+  "test_avg_accuracy": 50.8,
+  "overfit_gap": 2.6
+}
