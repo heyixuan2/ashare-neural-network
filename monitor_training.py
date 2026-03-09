@@ -543,25 +543,22 @@ def parse_test_results(status_msgs):
                 results["cal_1d_actual"] = actual
             except:
                 pass
-        if "Optimal temperature:" in m:
+        if "Best long threshold:" in m:
             try:
-                results["temperature"] = float(m.split("T=")[1].split()[0])
+                results["best_conf_thresh"] = m.split("threshold:")[1].split("(")[0].strip()
+                results["best_conf_edge"] = m.split("edge=")[1].split(")")[0].strip() if "edge=" in m else ""
             except:
                 pass
-        if "Optimal threshold:" in m:
+        if "Val optimal:" in m:
             try:
-                results["opt_threshold"] = float(m.split("threshold:")[1].split()[0])
-                results["val_f1"] = m.split("val F1=")[1].split(")")[0].strip() if "val F1=" in m else ""
+                results["val_thresh"] = m.split("thresh=")[1].split("(")[0].strip()
+                results["val_edge"] = m.split("edge=")[1].split(")")[0].strip() if "edge=" in m else ""
             except:
                 pass
-        if "Calibrated Test Metrics" in m:
-            results["has_calibrated"] = True
-        if "has_calibrated" in results and "Accuracy=" in m and "Precision=" in m:
+        if "Test result:" in m and "trades" in m:
             try:
-                results["cal_acc"] = m.split("Accuracy=")[1].split("%")[0].strip()
-                results["cal_prec"] = m.split("Precision=")[1].split("%")[0].strip()
-                results["cal_rec"] = m.split("Recall=")[1].split("%")[0].strip()
-                results["cal_f1"] = m.split("F1=")[1].split("%")[0].strip()
+                results["test_thresh_trades"] = m.split("→")[1].split("trades")[0].strip()
+                results["test_thresh_edge"] = m.split("edge=")[1].strip() if "edge=" in m else ""
             except:
                 pass
     return results
@@ -808,14 +805,15 @@ def draw_training(epochs, status_msgs):
             cal_diff = abs(test["cal_1d_pred"] - test["cal_1d_actual"])
             cal_icon = "✅" if cal_diff < 0.05 else "⚠️"
             print(f"    校准: pred_mean={test['cal_1d_pred']:.3f} actual={test['cal_1d_actual']:.3f}  {cal_icon}")
-        if test.get("temperature"):
-            print(f"    \033[1;36m温度校准:\033[0m T={test['temperature']:.1f} "
-                  f"| 最优阈值={test.get('opt_threshold', 0.5):.2f} "
-                  f"(val F1={test.get('val_f1', '?')})")
-        if test.get("cal_acc"):
-            print(f"    \033[1;36m校准后测试:\033[0m "
-                  f"Acc={test['cal_acc']}% P={test['cal_prec']}% "
-                  f"R={test['cal_rec']}% F1={test['cal_f1']}%")
+        if test.get("best_conf_thresh"):
+            print(f"    \033[1;36m最佳置信阈值:\033[0m {test['best_conf_thresh']} "
+                  f"(test edge={test.get('best_conf_edge', '?')})")
+        if test.get("val_thresh"):
+            print(f"    \033[1;36mVal最优阈值:\033[0m {test['val_thresh']} "
+                  f"(val edge={test.get('val_edge', '?')})")
+        if test.get("test_thresh_trades"):
+            print(f"    \033[1;36m应用到Test:\033[0m "
+                  f"{test['test_thresh_trades']} trades, edge={test.get('test_thresh_edge', '?')}")
         if test.get("overfit_msg"):
             print(f"    {test['overfit_msg']}")
         print()

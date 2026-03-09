@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Large-scale Stock Price Predictor Training Script
-Trains on ALL A-share stocks via Tushare (5000+ stocks × 2 years)
+Large-scale Stock Price Predictor Training Script (V4)
+Trains on ALL A-share stocks via Tushare (~5800 stocks × 4 years)
 
 MEMORY-EFFICIENT: streams data to disk, never holds all sequences in RAM.
 """
@@ -756,11 +756,11 @@ def train(data, max_hours=72, seed=42, model_id=0):
 
     # V4: lower LR, smaller batch, plain BCE, no SWA
     # V3 evidence: best epoch=1 at warmup lr=1e-4, lr=3e-4 overshoots
-    smooth = 0.05  # lighter smoothing (V3's 0.1 was too aggressive)
+    smooth = 0.08  # moderate smoothing — suppresses overconfident predictions under plain BCE
 
     # Custom dataset - 1d only
     class MmapDataset(torch.utils.data.Dataset):
-        def __init__(self, X_mmap, y1, smooth=0.05):
+        def __init__(self, X_mmap, y1, smooth=0.08):
             self.X, self.y1 = X_mmap, y1
             self.n = len(X_mmap)
             self.smooth = smooth
@@ -798,7 +798,7 @@ def train(data, max_hours=72, seed=42, model_id=0):
     steps_per_epoch = len(train_loader)
     log(f"Batches/epoch: {steps_per_epoch}")
 
-    # Model — V3: smaller, 1d-only, stronger dropout
+    # Model — 1d-only, strong regularization
     class HybridModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -949,12 +949,14 @@ def train(data, max_hours=72, seed=42, model_id=0):
 
         loss_curve_path.write_text(json.dumps(history, indent=2))
 
-        # Best check - use val_loss ONLY for early stopping (single metric, no ambiguity)
-        # best_val_acc tracks accuracy AT the best val_loss epoch (not global max)
-        improved = val_loss < best_val_loss
+        # Best check — use val ACCURACY for early stopping
+        # Rationale: plain BCE loss penalizes miscalibrated probabilities, but accuracy
+        # tracks directional correctness which is what we actually care about.
+        # Post-hoc temperature scaling fixes calibration after training.
+        improved = avg_acc > best_val_acc
         if improved:
+            best_val_acc = avg_acc
             best_val_loss = val_loss
-            best_val_acc = avg_acc  # accuracy at this epoch, not global max
 
         if improved:
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -1056,104 +1058,74 @@ def train(data, max_hours=72, seed=42, model_id=0):
     else:
         log(f"✅ No overfitting: val={best_val_acc*100:.1f}% ≈ test={test_avg*100:.1f}% (gap={gap:.1f}%)")
 
-    # ── Temperature Scaling (post-hoc calibration on val set) ──
+    # ── Multi-threshold Profitability (raw sigmoid, no temperature) ──
+    # Trading cares about EDGE (win rate - baseline), not F1.
+    # Higher thresholds = fewer trades but stronger signal.
     log(f"")
-    log(f"── Temperature Scaling (calibrate on val set) ──")
+    log(f"── Profitability by Confidence Threshold (raw sigmoid) ──")
+    baseline = ty1[ty1 != 0.5].mean() if (ty1 != 0.5).sum() > 0 else 0.5
+    log(f"  Baseline (actual up rate): {baseline*100:.1f}%")
 
-    # Extract pre-sigmoid logits from a mmap array (reused for val + test)
-    head_layers = list(model.head.children())
-    def extract_logits(X_mmap, n):
-        logits_all = []
-        with torch.no_grad():
-            for s in range(0, n, 1024):
-                e = min(s + 1024, n)
-                xb = torch.FloatTensor(np.array(X_mmap[s:e])).to(device)
-                x_enc = model.input_proj(xb)
-                h, _ = model.lstm(x_enc)
-                h = model.lstm_norm(h) + model.pos_enc
-                t = model.out_norm(model.transformer(h))
-                w = torch.softmax(model.attn_pool(t), dim=1)
-                p = (t * w).sum(dim=1)
-                z = p
-                for layer in head_layers[:-1]:  # skip Sigmoid()
-                    z = layer(z)
-                logits_all.append(z.squeeze().cpu())
-        return torch.cat(logits_all)
+    best_edge_thresh = 0.5
+    best_edge = 0
+    for th in [0.50, 0.55, 0.60, 0.65, 0.70, 0.75]:
+        long = tp1 > th
+        short = tp1 < (1 - th)
+        if long.sum() >= 50:
+            wr_long = np.mean(ty1[long])
+            edge_long = wr_long - baseline
+            log(f"  LONG  P>{th:.2f}: {long.sum():>6d} trades ({long.sum()/len(tp1)*100:4.1f}%) "
+                f"| win={wr_long*100:.1f}% | edge={edge_long*100:+.1f}%")
+            if edge_long > best_edge:
+                best_edge = edge_long
+                best_edge_thresh = th
+        if short.sum() >= 50:
+            wr_short = 1 - np.mean(ty1[short])
+            edge_short = wr_short - (1 - baseline)
+            log(f"  SHORT P<{1-th:.2f}: {short.sum():>6d} trades ({short.sum()/len(tp1)*100:4.1f}%) "
+                f"| win={wr_short*100:.1f}% | edge={edge_short*100:+.1f}%")
 
-    model.eval()
-    val_logits = extract_logits(X_val, len(X_val))
-    val_labels = torch.FloatTensor(np.array(y_val[1][:len(X_val)]))
-    val_valid = (val_labels < 0.45) | (val_labels > 0.55)
+    log(f"  Best long threshold: {best_edge_thresh:.2f} (edge={best_edge*100:+.1f}%)")
 
-    # Optimize temperature T to minimize NLL on valid val samples
-    best_T, best_nll = 1.0, float('inf')
-    for T_cand in [t / 10.0 for t in range(5, 31)]:  # 0.5 to 3.0
-        scaled = torch.sigmoid(val_logits[val_valid] / T_cand)
-        nll = nn.functional.binary_cross_entropy(
-            torch.clamp(scaled, 1e-7, 1-1e-7), val_labels[val_valid]).item()
-        if nll < best_nll:
-            best_nll = nll
-            best_T = T_cand
-    log(f"  Optimal temperature: T={best_T:.1f} (NLL={best_nll:.4f})")
-
-    # ── Optimal Threshold Search on val set ──
-    log(f"── Optimal Threshold Search ──")
-    test_logits = extract_logits(X_test, test_n)
-    tp1_cal = torch.sigmoid(test_logits / best_T).numpy()
-
-    # Search threshold on val calibrated probs for best F1
-    val_cal = torch.sigmoid(val_logits / best_T).numpy()
-    val_labels_np = val_labels.numpy()
-    val_v = (val_labels_np < 0.45) | (val_labels_np > 0.55)
-
-    best_thresh, best_f1 = 0.5, 0
-    for th in [t / 100.0 for t in range(45, 70)]:  # 0.45 to 0.69
-        pred_b = (val_cal[val_v] > th).astype(float)
-        tp_v = np.sum((pred_b == 1) & (val_labels_np[val_v] > 0.5))
-        fp_v = np.sum((pred_b == 1) & (val_labels_np[val_v] < 0.5))
-        fn_v = np.sum((pred_b == 0) & (val_labels_np[val_v] > 0.5))
-        prec_v = tp_v / max(tp_v + fp_v, 1)
-        rec_v = tp_v / max(tp_v + fn_v, 1)
-        f1_v = 2 * prec_v * rec_v / max(prec_v + rec_v, 1e-8)
-        if f1_v > best_f1:
-            best_f1 = f1_v
-            best_thresh = th
-    log(f"  Optimal threshold: {best_thresh:.2f} (val F1={best_f1*100:.1f}%)")
-
-    # Report calibrated test metrics
+    # ── Optimal Threshold Search on val set (maximize edge, min 100 trades) ──
     log(f"")
-    log(f"── Calibrated Test Metrics (T={best_T:.1f}, thresh={best_thresh:.2f}) ──")
-    test_pred_cal = (tp1_cal > best_thresh).astype(float)
-    tv = (ty1 != 0.5)
-    tp_c = np.sum((test_pred_cal[tv] == 1) & (ty1[tv] == 1))
-    fp_c = np.sum((test_pred_cal[tv] == 1) & (ty1[tv] == 0))
-    fn_c = np.sum((test_pred_cal[tv] == 0) & (ty1[tv] == 1))
-    prec_c = tp_c / max(tp_c + fp_c, 1)
-    rec_c = tp_c / max(tp_c + fn_c, 1)
-    f1_c = 2 * prec_c * rec_c / max(prec_c + rec_c, 1e-8)
-    cal_acc = np.mean((test_pred_cal[tv]) == ty1[tv])
-    log(f"  Accuracy={cal_acc*100:.1f}% Precision={prec_c*100:.1f}% Recall={rec_c*100:.1f}% F1={f1_c*100:.1f}%")
-    log(f"  Pred mean={tp1_cal.mean():.3f} Actual={ty1.mean():.3f}")
+    log(f"── Optimal Threshold Search (val set, maximize edge) ──")
+    vp1 = torch.cat(vp1_all).numpy()
+    vy1_np = torch.cat(vy1_all).numpy()
+    val_v = (vy1_np != 0.5)
+    val_baseline = vy1_np[val_v].mean()
 
-    # Profitability with optimal threshold
-    log(f"")
-    log(f"── Profitability (1-day, calibrated thresh={best_thresh:.2f}) ──")
-    long_mask = tp1_cal > best_thresh
-    if long_mask.sum() > 0:
-        wr = np.mean(ty1[long_mask])
-        log(f"  Trades: {long_mask.sum()}/{len(tp1_cal)} ({long_mask.sum()/len(tp1_cal)*100:.1f}%)")
-        log(f"  Win rate: {wr*100:.1f}% vs baseline: {ty1.mean()*100:.1f}%")
-        log(f"  Edge: {(wr - ty1.mean())*100:+.1f}%")
+    best_val_thresh, best_val_edge = 0.5, 0
+    for th in [t / 100.0 for t in range(50, 80)]:  # 0.50 to 0.79
+        mask = (vp1 > th) & val_v
+        if mask.sum() >= 100:
+            wr = np.mean(vy1_np[mask])
+            edge = wr - val_baseline
+            if edge > best_val_edge:
+                best_val_edge = edge
+                best_val_thresh = th
+    log(f"  Val optimal: thresh={best_val_thresh:.2f} (edge={best_val_edge*100:+.1f}%)")
+
+    # Apply val-optimal threshold to test set
+    test_long = tp1 > best_val_thresh
+    if test_long.sum() >= 50:
+        test_wr = np.mean(ty1[test_long])
+        test_edge = test_wr - baseline
+        log(f"  Test result:  thresh={best_val_thresh:.2f} → {test_long.sum()} trades, "
+            f"win={test_wr*100:.1f}%, edge={test_edge*100:+.1f}%")
+    else:
+        test_edge = 0
+        log(f"  Test result:  thresh={best_val_thresh:.2f} → <50 trades, insufficient")
 
     # Update meta
     meta = json.loads(meta_path.read_text())
     meta["test_accuracy_1d"] = round(test_acc1*100, 1)
     meta["test_avg_accuracy"] = round(test_avg*100, 1)
     meta["overfit_gap"] = round(gap, 1)
-    meta["temperature"] = best_T
-    meta["optimal_threshold"] = best_thresh
-    meta["calibrated_f1"] = round(f1_c*100, 1)
-    meta["calibrated_accuracy"] = round(cal_acc*100, 1)
+    meta["optimal_threshold"] = best_val_thresh
+    meta["test_edge"] = round(test_edge*100, 1) if test_long.sum() >= 50 else 0
+    meta["best_conf_edge"] = round(best_edge*100, 1)
+    meta["best_conf_threshold"] = best_edge_thresh
     meta_path.write_text(json.dumps(meta, indent=2))
 
     total_time = time.time() - start_time

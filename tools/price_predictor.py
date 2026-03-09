@@ -1,5 +1,5 @@
 """
-Stock Price Direction Predictor — LSTM + Transformer (V3, 1d-only)
+Stock Price Direction Predictor — LSTM + Transformer (V4, 1d-only)
 Predicts probability of price going UP in the next trading day.
 
 Architecture:
