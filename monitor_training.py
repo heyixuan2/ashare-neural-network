@@ -657,7 +657,7 @@ def draw_training(epochs, status_msgs):
     if latest["best"]:
         print("\033[1;33m★ NEW BEST\033[0m")
     else:
-        patience = 15
+        patience = 10
         print(f"\033[90m(best=E{best['epoch']}, patience {since_best}/{patience})\033[0m")
     print()
 
@@ -822,8 +822,8 @@ def draw_training(epochs, status_msgs):
     total_time = sum(e["time"] for e in epochs)
     avg_time = total_time / len(epochs)
     print(f"  \033[1m⏱️ 时间:\033[0m")
-    print(f"    每Epoch: {avg_time:.0f}s | 已用: {total_time / 3600:.1f}h | patience: {since_best}/15")
-    if since_best < 15 and not test.get("test_avg"):
+    print(f"    每Epoch: {avg_time:.0f}s | 已用: {total_time / 3600:.1f}h | patience: {since_best}/10")
+    if since_best < 10 and not test.get("test_avg"):
         remaining = (15 - since_best) * avg_time
         print(f"    最多还需: {remaining / 3600:.1f}h (当前模型)")
     if ens["total"] > 1:

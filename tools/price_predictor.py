@@ -133,7 +133,7 @@ def _feature_engineer(prices: list, market_data: dict = None, industry: str = No
         k_vals[i] = 2/3 * k_vals[i-1] + 1/3 * rsv
         d_vals[i] = 2/3 * d_vals[i-1] + 1/3 * k_vals[i]
     j_vals = 3 * k_vals - 2 * d_vals
-    features.extend([k_vals/100, d_vals/100, j_vals/100])
+    features.extend([d_vals/100, j_vals/100])
 
     # Trend strength (ADX-like: ratio of directional move to range)
     atr = np.zeros(n)
@@ -145,7 +145,7 @@ def _feature_engineer(prices: list, market_data: dict = None, industry: str = No
     features.append(atr_ma / np.maximum(close, 1e-8))  # ATR ratio
 
     # Price position within range (where is close relative to N-day high/low)
-    for w in [10, 30]:
+    for w in [30]:
         pos = np.zeros(n)
         for i in range(w, n):
             h_w = np.max(high[i-w:i+1])
@@ -222,7 +222,6 @@ def _feature_engineer(prices: list, market_data: dict = None, industry: str = No
     if extra_data:
         # Valuation features (normalized by rolling stats in _build_sequences)
         pe_arr = np.zeros(n)
-        pb_arr = np.zeros(n)
         dv_arr = np.zeros(n)  # dividend yield
         turnover_arr = np.zeros(n)
         # Fund flow features
@@ -236,7 +235,6 @@ def _feature_engineer(prices: list, market_data: dict = None, industry: str = No
             if date in extra_data:
                 ed = extra_data[date]
                 pe_arr[i] = ed.get("pe", 0)
-                pb_arr[i] = ed.get("pb", 0)
                 dv_arr[i] = ed.get("dv", 0)
                 turnover_arr[i] = ed.get("turnover", 0)
                 net_mf_arr[i] = ed.get("net_mf", 0)
@@ -244,9 +242,7 @@ def _feature_engineer(prices: list, market_data: dict = None, industry: str = No
                 sm_net_arr[i] = ed.get("sm_net", 0)
                 big_ratio_arr[i] = ed.get("big_ratio", 0)
 
-        # Log-transform PE/PB to reduce skew (PE can be 5 or 5000)
         pe_log = np.sign(pe_arr) * np.log1p(np.abs(pe_arr))
-        pb_log = np.sign(pb_arr) * np.log1p(np.abs(pb_arr))
 
         # Margin trading features (融资融券)
         rzye_arr = np.zeros(n)  # 融资余额
@@ -264,12 +260,11 @@ def _feature_engineer(prices: list, market_data: dict = None, industry: str = No
                 # is_margin = 1 if this date has real margin data (rzye > 0)
                 is_margin_arr[i] = 1.0 if ed.get("rzye", 0) > 0 else 0.0
 
-        features.extend([pe_log, pb_log, dv_arr, turnover_arr,
+        features.extend([pe_log, dv_arr, turnover_arr,
                          net_mf_arr, big_net_arr, sm_net_arr, big_ratio_arr,
                          rzye_arr, rz_net_arr, rq_ratio_arr, is_margin_arr])
     else:
-        # Pad with zeros if no extra data
-        for _ in range(12):
+        for _ in range(11):
             features.append(np.zeros(n))
 
     # ── Sector (申万行业指数) daily return ──
@@ -429,12 +424,12 @@ def _build_sequences(X: np.ndarray, y: Dict[int, np.ndarray], seq_len=30, norm_w
 
 
 class StockPredictor:
-    """LSTM + Transformer hybrid model for stock prediction — V3 (1d-only)
+    """LSTM + Transformer hybrid model for stock prediction — V4.1 (1d-only, 48 features)
 
     Architecture must match train_predictor.py HybridModel exactly:
     - InputProj(input_dim→64, dropout=0.2) → LSTM(1 layer, 64)
-    - Transformer(2 layers, 4 heads, ff=256, dropout=0.4)
-    - AttentionPooling → Dropout(0.5) → head (64→16→1)
+    - Transformer(2 layers, 4 heads, ff=256, dropout=0.3)
+    - AttentionPooling → Dropout(0.4) → head (64→16→1)
     """
 
     # Default architecture matches V3 train_predictor.py
@@ -462,15 +457,14 @@ class StockPredictor:
                 self.pos_enc = nn.Parameter(torch.randn(1, seq_len, hidden_dim) * 0.02)
                 enc_layer = nn.TransformerEncoderLayer(
                     d_model=hidden_dim, nhead=n_heads,
-                    dim_feedforward=hidden_dim*4, dropout=0.4,
+                    dim_feedforward=hidden_dim*4, dropout=0.3,
                     batch_first=True, activation='gelu'
                 )
                 self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
                 self.out_norm = nn.LayerNorm(hidden_dim)
                 self.attn_pool = nn.Linear(hidden_dim, 1)
-                # Single head — 1d prediction only
                 self.head = nn.Sequential(
-                    nn.Dropout(0.5),
+                    nn.Dropout(0.4),
                     nn.Linear(hidden_dim, 16), nn.GELU(),
                     nn.Linear(16, 1), nn.Sigmoid())
 

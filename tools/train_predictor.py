@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Large-scale Stock Price Predictor Training Script (V4)
+Large-scale Stock Price Predictor Training Script (V4.1)
 Trains on ALL A-share stocks via Tushare (~5800 stocks × 4 years)
+V4.1: removed 3 harmful features (51→48), lower dropout, LR warmup, larger effective batch
 
 MEMORY-EFFICIENT: streams data to disk, never holds all sequences in RAM.
 """
@@ -779,8 +780,8 @@ def train(data, max_hours=72, seed=42, model_id=0):
     n_heads = 4
     n_layers = 2
     lstm_layers = 1
-    max_epochs = 60    # was 200 — with constant lr, no need for many epochs
-    patience = 15      # was 10 — give more room with lower lr
+    max_epochs = 30    # V4.1: best epochs were E2-E6, no need for 60
+    patience = 10      # V4.1: tighter patience matches early convergence pattern
 
     # Class balance - 1d only
     def real_mean(arr):
@@ -810,13 +811,13 @@ def train(data, max_hours=72, seed=42, model_id=0):
             self.pos_enc = nn.Parameter(torch.randn(1, seq_len, hidden_dim) * 0.02)
             enc_layer = nn.TransformerEncoderLayer(
                 d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim*4,
-                dropout=0.4, batch_first=True, activation='gelu')  # dropout 0.3→0.4
+                dropout=0.3, batch_first=True, activation='gelu')
             self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
             self.out_norm = nn.LayerNorm(hidden_dim)
             self.attn_pool = nn.Linear(hidden_dim, 1)
             # Single head — 1d prediction only
             self.head = nn.Sequential(
-                nn.Dropout(0.5),  # aggressive dropout before final head
+                nn.Dropout(0.4),
                 nn.Linear(hidden_dim, 16), nn.GELU(),
                 nn.Linear(16, 1), nn.Sigmoid())
 
@@ -834,8 +835,7 @@ def train(data, max_hours=72, seed=42, model_id=0):
     log(f"Model: {total_params:,} parameters")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-    # Constant LR — V3 showed best epoch at lr=1e-4, cosine schedule didn't help
-    # No warmup, no scheduler: just train at the sweet spot
+    warmup_steps = steps_per_epoch  # 1 epoch warmup: stabilize initial gradient direction across seeds
 
     # Plain BCE with valid-sample masking (0.5 = unknown label, skip)
     class MaskedBCE(nn.Module):
@@ -848,9 +848,7 @@ def train(data, max_hours=72, seed=42, model_id=0):
 
     criterion = MaskedBCE()
 
-    # Gradient accumulation: effective batch = 256 * 4 = 1024
-    # Small per-step batch for noise, but accumulated gradient is stable
-    accum_steps = 4
+    accum_steps = 8  # V4.1: effective batch 2048 — reduce gradient noise across seeds
     log(f"Effective batch size: {batch_size * accum_steps} (micro={batch_size} × accum={accum_steps})")
 
     best_val_loss = float('inf')
@@ -867,7 +865,8 @@ def train(data, max_hours=72, seed=42, model_id=0):
     meta_path = MODEL_DIR / f"predictor_meta{suffix}.json"
     loss_curve_path = MODEL_DIR / f"loss_curve{suffix}.json"
 
-    log(f"Training: max {max_epochs} epochs, patience {patience}, constant lr={lr}")
+    global_step = 0
+    log(f"Training: max {max_epochs} epochs, patience {patience}, lr={lr} (warmup 1 epoch)")
 
     for epoch in range(max_epochs):
         elapsed = time.time() - start_time
@@ -899,6 +898,15 @@ def train(data, max_hours=72, seed=42, model_id=0):
             if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
                 gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 grad_norms.append(gn.item() if hasattr(gn, 'item') else float(gn))
+                # Linear warmup for first epoch, then constant LR
+                global_step += 1
+                if global_step <= warmup_steps:
+                    warmup_lr = lr * global_step / warmup_steps
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = warmup_lr
+                elif global_step == warmup_steps + 1:
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = lr
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -1235,12 +1243,12 @@ def permutation_importance(data, model_id=0):
             self.pos_enc = nn.Parameter(torch.randn(1, seq_len, hidden_dim) * 0.02)
             enc_layer = nn.TransformerEncoderLayer(
                 d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim*4,
-                dropout=0.4, batch_first=True, activation='gelu')
+                dropout=0.3, batch_first=True, activation='gelu')
             self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
             self.out_norm = nn.LayerNorm(hidden_dim)
             self.attn_pool = nn.Linear(hidden_dim, 1)
             self.head = nn.Sequential(
-                nn.Dropout(0.5), nn.Linear(hidden_dim, 16), nn.GELU(),
+                nn.Dropout(0.4), nn.Linear(hidden_dim, 16), nn.GELU(),
                 nn.Linear(16, 1), nn.Sigmoid())
         def forward(self, x):
             x = self.input_proj(x)
@@ -1287,15 +1295,15 @@ def permutation_importance(data, model_id=0):
         "bb_pos",
         "vol_ratio5", "vol_ratio20",
         "body", "upper_shadow", "lower_shadow",
-        "kdj_k", "kdj_d", "kdj_j",
+        "kdj_d", "kdj_j",
         "atr_ratio",
-        "price_pos10", "price_pos30",
+        "price_pos30",
         "obv_norm",
         "gap",
         "ind_0", "ind_1", "ind_2", "ind_3",
         "dow_sin", "dow_cos", "month_sin", "month_cos",
         "idx_ret", "rel_strength",
-        "pe_log", "pb_log", "dv_yield", "turnover",
+        "pe_log", "dv_yield", "turnover",
         "net_mf", "big_net", "sm_net", "big_ratio",
         "rzye", "rz_net", "rq_ratio", "is_margin",
         "sector_ret", "sector_vs_stock",
@@ -1356,7 +1364,7 @@ def permutation_importance(data, model_id=0):
 
 if __name__ == "__main__":
     log("=" * 60)
-    log("Stock Price Predictor - Large-Scale Training V4 (1d-only)")
+    log("Stock Price Predictor - Large-Scale Training V4.1 (1d-only, 48 features)")
     log("=" * 60)
     data = collect_data()
 
