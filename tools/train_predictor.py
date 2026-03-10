@@ -1130,10 +1130,10 @@ def train(data, max_hours=72, seed=42, model_id=0):
     meta["test_accuracy_1d"] = round(test_acc1*100, 1)
     meta["test_avg_accuracy"] = round(test_avg*100, 1)
     meta["overfit_gap"] = round(gap, 1)
-    meta["optimal_threshold"] = best_val_thresh
-    meta["test_edge"] = round(test_edge*100, 1) if test_long.sum() >= 50 else 0
-    meta["best_conf_edge"] = round(best_edge*100, 1)
-    meta["best_conf_threshold"] = best_edge_thresh
+    meta["optimal_threshold"] = float(best_val_thresh)
+    meta["test_edge"] = float(round(test_edge*100, 1)) if test_long.sum() >= 50 else 0.0
+    meta["best_conf_edge"] = float(round(best_edge*100, 1))
+    meta["best_conf_threshold"] = float(best_edge_thresh)
     meta_path.write_text(json.dumps(meta, indent=2))
 
     total_time = time.time() - start_time
@@ -1154,19 +1154,204 @@ def train_ensemble(data, n_models=3, max_hours_per_model=24):
         log(f"Model {i+1}/{n_models} (seed={42+i})")
         log(f"{'='*60}")
 
-        # Each model gets a different seed → different initialization + shuffling
         result_meta = train(data, max_hours=max_hours_per_model, seed=42+i, model_id=i)
         all_results.append(result_meta)
 
-    # Summary
+    # Summary — sorted by test accuracy
     log("\n" + "=" * 60)
     log("ENSEMBLE SUMMARY")
     log("=" * 60)
+    results_with_meta = []
     for i, r in enumerate(all_results):
         if r and Path(r).exists():
             meta = json.loads(Path(r).read_text())
-            log(f"Model {i}: test_avg={meta.get('test_avg_accuracy','?')}% "
-                f"val_loss={meta.get('val_loss','?')}")
+            results_with_meta.append((i, meta))
+            log(f"Model {i} (seed={42+i}): test={meta.get('test_avg_accuracy','?')}% "
+                f"val={meta.get('accuracy_1d','?')}% "
+                f"edge={meta.get('test_edge','?')}% "
+                f"epoch={meta.get('epoch','?')}")
+
+    # Rank by test accuracy
+    if results_with_meta:
+        ranked = sorted(results_with_meta, key=lambda x: x[1].get('test_avg_accuracy', 0), reverse=True)
+        log("")
+        log("RANKING (by test accuracy):")
+        for rank, (i, meta) in enumerate(ranked):
+            marker = " ★ BEST" if rank == 0 else ""
+            log(f"  #{rank+1} Model {i} (seed={42+i}): "
+                f"test={meta.get('test_avg_accuracy','?')}% "
+                f"edge@0.75={meta.get('best_conf_edge','?')}%{marker}")
+
+        # Stats
+        test_accs = [m.get('test_avg_accuracy', 50) for _, m in results_with_meta]
+        good = [a for a in test_accs if a > 52]
+        log(f"")
+        log(f"Signal stability: {len(good)}/{len(test_accs)} models with test>52%")
+        log(f"Test acc: mean={np.mean(test_accs):.1f}% std={np.std(test_accs):.1f}% "
+            f"min={np.min(test_accs):.1f}% max={np.max(test_accs):.1f}%")
+
+
+def permutation_importance(data, model_id=0):
+    """Measure feature importance by shuffling each feature and observing accuracy drop."""
+    import torch
+
+    log("=" * 60)
+    log("PERMUTATION IMPORTANCE ANALYSIS")
+    log("=" * 60)
+
+    X_val = data["X_val"]
+    y_val = data["y_val"]
+
+    suffix = f"_{model_id}" if model_id > 0 else ""
+    meta_path = MODEL_DIR / f"predictor_meta{suffix}.json"
+    checkpoint_path = MODEL_DIR / f"predictor_best{suffix}.pt"
+
+    if not meta_path.exists() or not checkpoint_path.exists():
+        log(f"Model {model_id} not found, skipping importance analysis")
+        return
+
+    meta = json.loads(meta_path.read_text())
+    log(f"Using Model {model_id} (seed={42+model_id}, test_acc={meta.get('test_avg_accuracy','?')}%)")
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    input_dim = meta["input_dim"]
+    seq_len = meta["seq_len"]
+
+    # Rebuild model
+    import torch.nn as nn
+    hidden_dim = meta["hidden_dim"]
+    n_heads = meta["n_heads"]
+    n_layers = meta["n_layers"]
+    lstm_layers = meta.get("lstm_layers", 1)
+
+    class HybridModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_proj = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(), nn.Dropout(0.2))
+            self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True,
+                                num_layers=lstm_layers, dropout=0.0)
+            self.lstm_norm = nn.LayerNorm(hidden_dim)
+            self.pos_enc = nn.Parameter(torch.randn(1, seq_len, hidden_dim) * 0.02)
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim*4,
+                dropout=0.4, batch_first=True, activation='gelu')
+            self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+            self.out_norm = nn.LayerNorm(hidden_dim)
+            self.attn_pool = nn.Linear(hidden_dim, 1)
+            self.head = nn.Sequential(
+                nn.Dropout(0.5), nn.Linear(hidden_dim, 16), nn.GELU(),
+                nn.Linear(16, 1), nn.Sigmoid())
+        def forward(self, x):
+            x = self.input_proj(x)
+            h, _ = self.lstm(x)
+            h = self.lstm_norm(h) + self.pos_enc
+            t = self.out_norm(self.transformer(h))
+            w = torch.softmax(self.attn_pool(t), dim=1)
+            p = (t * w).sum(dim=1)
+            return self.head(p)
+
+    model = HybridModel().to(device)
+    state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(state)
+    model.eval()
+
+    # Baseline accuracy on val set (subsample for speed)
+    val_n = min(len(X_val), 50000)
+    indices = np.random.choice(len(X_val), val_n, replace=False)
+    X_sub = np.array(X_val[indices])
+    y_sub = np.array(y_val[1][indices])
+    valid = (y_sub != 0.5)
+
+    def get_acc(X_arr):
+        preds = []
+        with torch.no_grad():
+            for s in range(0, len(X_arr), 1024):
+                e = min(s + 1024, len(X_arr))
+                xb = torch.FloatTensor(X_arr[s:e]).to(device)
+                pred = model(xb)
+                preds.append(pred.squeeze().cpu().numpy())
+        preds = np.concatenate(preds)
+        return np.mean((preds[valid] > 0.5) == y_sub[valid])
+
+    baseline_acc = get_acc(X_sub)
+    log(f"Baseline val accuracy (n={val_n}): {baseline_acc*100:.2f}%")
+    log("")
+
+    feature_names = [
+        "ret1", "ret5", "ret20",
+        "ma5_ratio", "ma20_ratio", "ma60_ratio",
+        "vol5", "vol20",
+        "rsi14",
+        "macd_dif", "macd_hist",
+        "bb_pos",
+        "vol_ratio5", "vol_ratio20",
+        "body", "upper_shadow", "lower_shadow",
+        "kdj_k", "kdj_d", "kdj_j",
+        "atr_ratio",
+        "price_pos10", "price_pos30",
+        "obv_norm",
+        "gap",
+        "ind_0", "ind_1", "ind_2", "ind_3",
+        "dow_sin", "dow_cos", "month_sin", "month_cos",
+        "idx_ret", "rel_strength",
+        "pe_log", "pb_log", "dv_yield", "turnover",
+        "net_mf", "big_net", "sm_net", "big_ratio",
+        "rzye", "rz_net", "rq_ratio", "is_margin",
+        "sector_ret", "sector_vs_stock",
+        "north_flow", "nf_ratio",
+    ]
+    if len(feature_names) != input_dim:
+        feature_names = [f"f{i}" for i in range(input_dim)]
+        log(f"Warning: feature name count mismatch, using f0..f{input_dim-1}")
+
+    # Permutation importance: shuffle each feature across the seq dimension
+    n_repeats = 3
+    importances = []
+    for feat_idx in range(input_dim):
+        drops = []
+        for _ in range(n_repeats):
+            X_perm = X_sub.copy()
+            # Shuffle this feature across samples (break the feature-label relationship)
+            perm_idx = np.random.permutation(val_n)
+            X_perm[:, :, feat_idx] = X_perm[perm_idx, :, feat_idx]
+            perm_acc = get_acc(X_perm)
+            drops.append(baseline_acc - perm_acc)
+        mean_drop = np.mean(drops)
+        importances.append((feat_idx, feature_names[feat_idx], mean_drop))
+
+    # Sort by importance (biggest drop = most important)
+    importances.sort(key=lambda x: x[2], reverse=True)
+
+    log("FEATURE IMPORTANCE (acc drop when shuffled):")
+    log(f"{'Rank':>4} {'Feature':<20} {'Acc Drop':>10} {'Impact':>10}")
+    log("-" * 48)
+    for rank, (idx, name, drop) in enumerate(importances):
+        if drop > 0.001:
+            label = "★ KEY"
+        elif drop > 0:
+            label = "useful"
+        elif drop > -0.001:
+            label = "neutral"
+        else:
+            label = "⚠ HARMFUL"
+        log(f"{rank+1:>4} {name:<20} {drop*100:>+9.3f}%  {label}")
+
+    # Summary
+    harmful = [x for x in importances if x[2] < -0.001]
+    neutral = [x for x in importances if -0.001 <= x[2] <= 0.001]
+    useful = [x for x in importances if x[2] > 0.001]
+    log("")
+    log(f"Summary: {len(useful)} useful, {len(neutral)} neutral, {len(harmful)} harmful")
+    if harmful:
+        log(f"Harmful features (consider removing): {', '.join(x[1] for x in harmful)}")
+
+    # Save results
+    importance_path = MODEL_DIR / "feature_importance.json"
+    importance_data = [{"rank": r+1, "feature": name, "index": idx, "acc_drop": round(drop*100, 4)}
+                       for r, (idx, name, drop) in enumerate(importances)]
+    importance_path.write_text(json.dumps(importance_data, indent=2))
+    log(f"Saved to {importance_path}")
 
 
 if __name__ == "__main__":
@@ -1174,5 +1359,20 @@ if __name__ == "__main__":
     log("Stock Price Predictor - Large-Scale Training V4 (1d-only)")
     log("=" * 60)
     data = collect_data()
-    # Train 3 models for ensemble (8h each max = 24h total max)
-    train_ensemble(data, n_models=3, max_hours_per_model=20)
+
+    # Phase 1: 10-seed search to assess signal stability
+    train_ensemble(data, n_models=10, max_hours_per_model=4)
+
+    # Phase 1.5: Feature importance using the best model
+    # Find best model by test accuracy
+    best_id, best_acc = 0, 0
+    for i in range(10):
+        suffix = f"_{i}" if i > 0 else ""
+        mp = MODEL_DIR / f"predictor_meta{suffix}.json"
+        if mp.exists():
+            m = json.loads(mp.read_text())
+            if m.get("test_avg_accuracy", 0) > best_acc:
+                best_acc = m["test_avg_accuracy"]
+                best_id = i
+    log(f"\nBest model for importance analysis: Model {best_id} (test={best_acc}%)")
+    permutation_importance(data, model_id=best_id)

@@ -506,7 +506,7 @@ class StockPredictor:
         return predictor
 
     @classmethod
-    def load_ensemble(cls, model_dir, n_models=3):
+    def load_ensemble(cls, model_dir, n_models=10):
         """Load ensemble of models trained by train_predictor.py"""
         import torch, json
         from pathlib import Path
@@ -524,8 +524,8 @@ class StockPredictor:
                 hidden_dim=meta["hidden_dim"],
                 n_heads=meta["n_heads"],
                 n_layers=meta["n_layers"],
-            lstm_layers=meta.get("lstm_layers", 1),
-        )
+                lstm_layers=meta.get("lstm_layers", 1),
+            )
             state = torch.load(pt_path, map_location=p.device, weights_only=True)
             p.model.load_state_dict(state)
             p.model.eval()

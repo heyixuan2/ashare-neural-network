@@ -839,17 +839,30 @@ def draw_training(epochs, status_msgs):
         print(f"  \033[1;36m{'═' * 64}\033[0m")
         print(f"  \033[1;36m ENSEMBLE 汇总 ({len(metas)} 模型)\033[0m")
         print(f"  \033[1;36m{'═' * 64}\033[0m")
-        print(f"  \033[90m  {'Model':>6} │ {'ValLoss':>8} │ {'1d%':>6} │ {'Test%':>6} │ {'Epoch':>5}\033[0m")
-        print(f"  \033[90m  {'─' * 6}─┼─{'─' * 8}─┼─{'─' * 6}─┼─{'─' * 6}─┼─{'─' * 5}\033[0m")
-        for i, meta in enumerate(metas):
-            test_avg = meta.get("test_avg_accuracy", "?")
-            print(f"    M{i:>3d}  \033[90m│\033[0m {meta.get('val_loss', 0):8.4f} \033[90m│\033[0m "
-                  f"{meta.get('accuracy_1d', 0):5.1f}% \033[90m│\033[0m "
-                  f"{test_avg if isinstance(test_avg, (int, float)) else '  ?  ':>5}% \033[90m│\033[0m "
-                  f"E{meta.get('epoch', '?')}")
-        avg_test = [m.get("test_avg_accuracy", 0) for m in metas if isinstance(m.get("test_avg_accuracy"), (int, float))]
-        if avg_test:
-            print(f"    \033[1m平均 Test: {sum(avg_test) / len(avg_test):.1f}%\033[0m")
+        print(f"  \033[90m  {'#':>2} {'Model':>5} {'Seed':>5} │ {'Val%':>5} │ {'Test%':>6} │ {'Edge':>6} │ {'Ep':>3}\033[0m")
+        print(f"  \033[90m  {'─'*2}─{'─'*5}─{'─'*5}─┼─{'─'*5}─┼─{'─'*6}─┼─{'─'*6}─┼─{'─'*3}\033[0m")
+
+        ranked = sorted(enumerate(metas), key=lambda x: x[1].get("test_avg_accuracy", 0), reverse=True)
+        for rank, (i, meta) in enumerate(ranked):
+            test_acc = meta.get("test_avg_accuracy", 0)
+            edge = meta.get("test_edge", 0)
+            seed = 42 + i
+            marker = "\033[33m★\033[0m" if rank == 0 else " "
+            tc = "\033[32m" if test_acc > 52 else "\033[33m" if test_acc > 50 else "\033[31m"
+            ec = "\033[32m" if edge > 1 else "\033[33m" if edge > 0 else "\033[31m"
+            print(f"  {rank+1:>3} M{i:>3d}  {seed:>4}  \033[90m│\033[0m "
+                  f"{meta.get('accuracy_1d', 0):5.1f} \033[90m│\033[0m "
+                  f"{tc}{test_acc:5.1f}%\033[0m \033[90m│\033[0m "
+                  f"{ec}{edge:+5.1f}%\033[0m \033[90m│\033[0m "
+                  f"E{meta.get('epoch', '?'):>2}{marker}")
+
+        test_accs = [m.get("test_avg_accuracy", 0) for m in metas if isinstance(m.get("test_avg_accuracy"), (int, float))]
+        if test_accs:
+            good = [a for a in test_accs if a > 52]
+            print(f"    \033[1m信号稳定性: {len(good)}/{len(test_accs)} 模型 test>52%\033[0m")
+            print(f"    \033[1m平均={sum(test_accs)/len(test_accs):.1f}% "
+                  f"std={__import__('statistics').stdev(test_accs) if len(test_accs)>1 else 0:.1f}% "
+                  f"max={max(test_accs):.1f}% min={min(test_accs):.1f}%\033[0m")
 
 
 def main():
