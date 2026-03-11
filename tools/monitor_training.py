@@ -1,12 +1,12 @@
 """
 训练监控脚本 — 实时查看数据收集 + 训练进度
-用法: python monitor_training.py
+用法: python scripts/monitor.py
 """
 import json, time, os, sys, glob, re, random
 from pathlib import Path
 from datetime import datetime
 
-BASE = Path(__file__).parent
+BASE = Path(__file__).resolve().parents[1]
 LOG = BASE / "models" / "training_log.jsonl"
 OUTPUT_LOG = BASE / "models" / "training_output.log"
 CACHE_DIR = BASE / ".cache"

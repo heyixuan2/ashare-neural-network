@@ -53,13 +53,13 @@ pip install torch tushare numpy pandas python-dotenv
 ### 3. Train
 
 ```bash
-python tools/train_predictor.py
+python scripts/train.py
 ```
 
 ### 4. Monitor training
 
 ```bash
-python monitor_training.py
+python scripts/monitor.py
 ```
 
 ## Recommended way to use the trained models
@@ -157,10 +157,14 @@ So the project is better thought of as a **signal ranking / confidence filtering
 
 ```text
 ashare-neural-network/
+├── README.md
+├── scripts/
+│   ├── train.py                # user-facing training entrypoint
+│   └── monitor.py              # user-facing monitor entrypoint
 ├── tools/
 │   ├── train_predictor.py      # data collection + training pipeline
-│   └── price_predictor.py      # feature engineering + model definition + loading
-├── monitor_training.py         # terminal training dashboard
+│   ├── price_predictor.py      # feature engineering + model definition + loading
+│   └── monitor_training.py     # terminal dashboard implementation
 ├── models/                     # checkpoints, meta, loss curves, feature importance
 │   └── splits/                 # train/val/test data (.npy, mmap)
 ├── data/ashare_daily/          # permanent raw OHLCV backup
