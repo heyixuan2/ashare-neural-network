@@ -1,128 +1,204 @@
 # A-Share Neural Network
 
-LSTM-Transformer hybrid model for A-share stock 1-day price direction prediction.
+Deep learning pipeline for predicting **next-day direction** of A-share stocks.
 
-## Architecture (V4)
+This project trains an LSTM-Transformer ensemble on ~3M sequences built from ~5800 A-share stocks. The goal is simple: given recent stock + market context, estimate the probability that a stock goes **up on the next trading day**.
 
-```
-Input (51-dim, seq_len=30) → Linear(64) + LayerNorm + GELU + Dropout(0.2)
-  → LSTM(64, 1 layer) + LayerNorm + Positional Encoding
-  → TransformerEncoder(2 layers, 4 heads, ffn=256, dropout=0.4)
-  → LayerNorm → Attention Pooling
-  → Dropout(0.5) → Linear(64→16) + GELU → Linear(16→1) → Sigmoid
-```
+## What this repo does
 
-**~140K parameters** — intentionally small to match low signal-to-noise ratio in daily stock data.
+- Collects and caches A-share market data from Tushare Pro
+- Builds engineered features for individual stocks, market, sector, margin, and northbound flow
+- Trains a **1-day-only** deep model on large-scale walk-forward splits
+- Saves multiple trained models for ensemble inference
+- Includes a terminal monitor for training progress
+- Runs permutation importance to identify useful / neutral / harmful features
 
-## Version History
+## Current status
 
-| Version | Params | Config | Targets | Loss | LR Schedule | Key Change |
-|---------|--------|--------|---------|------|-------------|------------|
-| V2 | 1.2M | 128/8/4/3 | 1d+3d+5d | Asymmetric Focal | Cosine+Warmup | Baseline |
-| V3 | 140K | 64/4/2/1 | 1d only | Asymmetric Focal | Cosine+Warmup(3ep) | Smaller model, +SWA |
-| V4 | 140K | 64/4/2/1 | 1d only | Plain BCE | Constant 1e-4 | Remove SWA, temp scaling |
+**What works now**
+- Data collection pipeline works
+- Large-scale training pipeline works
+- 10-model ensemble training works
+- Feature importance analysis works
+- Trained model checkpoints can be loaded from `models/`
 
-**Why 1d only?** V2 showed 3d/5d predictions ≈ random (48.5%/47.8% on test set). All capacity now focuses on the only horizon with detectable signal.
+**What still needs a small glue layer**
+- The recommended production inference path is to use the **pretrained ensemble**
+- A dedicated helper like `predict_with_ensemble(symbol)` still needs to be wired up cleanly
+- `predict_stock()` exists, but it is **not** the preferred deployment path because it retrains a small model from scratch instead of using the pretrained ensemble
 
-**V3→V4 changes:**
-- LR: 3e-4 → 1e-4 (V3 best epoch consistently at warmup lr ≈ 1e-4)
-- Batch: 1024 → 256 micro × 4 accumulation (implicit regularization via gradient noise)
-- Loss: Asymmetric Focal BCE → plain BCE (fewer hyperparameters, same signal strength)
-- Removed SWA (hurt probability calibration, negligible accuracy gain)
-- Added post-hoc temperature scaling + optimal threshold search
-- Label smoothing: 0.10 → 0.05
+## Quick start
 
-## Features (51 dimensions)
-
-| Category | Features | Dims |
-|----------|----------|------|
-| Returns | 1-day, 5-day, 20-day log returns | 3 |
-| Moving Averages | Price / MA ratio (5, 20, 60-day) | 3 |
-| Volatility | Rolling std of returns (5, 20-day) | 2 |
-| RSI | Relative Strength Index (14-day) | 1 |
-| MACD | DIF, histogram (normalized by price) | 2 |
-| Bollinger | Price position within Bollinger Band (20-day) | 1 |
-| Volume | Volume / MA ratio (5, 20-day) | 2 |
-| Candlestick | Body ratio, upper shadow, lower shadow | 3 |
-| KDJ | K, D, J values (9-day, normalized to 0-1) | 3 |
-| ATR | Average True Range ratio (14-day) | 1 |
-| Price Position | Close within N-day high-low range (10, 30-day) | 2 |
-| OBV | On-Balance Volume (20-day z-score, clipped) | 1 |
-| Gap | Opening gap / previous close | 1 |
-| Industry | Hash-based sector embedding (4-dim, isolated RNG) | 4 |
-| Calendar | Day-of-week sin/cos, month sin/cos (cyclical) | 4 |
-| Market | Index return (沪深300), stock-vs-index relative strength | 2 |
-| Fundamental | PE, PB (log-transformed), dividend yield, turnover rate | 4 |
-| Money Flow | Net inflow, big-order net ratio, small-order net ratio, big-order share | 4 |
-| Margin | 融资余额, 融资净买入比, 融券占比, is_margin flag | 4 |
-| Sector | 申万行业 daily return, stock-vs-sector differential | 2 |
-| HSGT | Northbound flow (沪股通+深股通), flow / 5-day MA ratio | 2 |
-
-## Data Pipeline
-
-- **Source**: Tushare Pro API (~5800 A-share stocks, 2022-01-01 to present)
-- **Price adjustment**: Forward-adjusted (前复权) via per-day `adj_factor`
-- **Normalization**: Rolling 60-day z-score per feature (constant features like industry encoding preserved raw)
-- **Sequence length**: 30 trading days
-- **Labels**: Binary (up=1 / down=0) with ATR-adaptive threshold (`max(0.002, ATR_20d × 0.15)`); ambiguous moves → NaN → excluded
-- **Storage**: Stream-to-disk `.bin` → memory-mapped `.npy` (handles 3M+ sequences without RAM bottleneck)
-
-## Training (V4)
-
-- **Temporal split** (walk-forward, no shuffling):
-  - Train: ≤ 2025-06-25
-  - Val: 2025-07-03 ~ 2025-10-24
-  - Test: ≥ 2025-10-31
-  - 5 trading-day gap between each split to prevent label boundary leakage
-- **Loss**: `nn.functional.binary_cross_entropy` with valid-sample masking (labels at 0.5 = unknown, skipped)
-- **Optimizer**: AdamW (lr=1e-4 constant, weight_decay=5e-2)
-- **Batch**: 256 micro-batch × 4 gradient accumulation = 1024 effective batch
-- **Label smoothing**: 0.05 (labels clipped to [0.05, 0.95])
-- **Regularization**: Dropout 0.2 (input) + 0.4 (transformer) + 0.5 (head), weight decay 5e-2, grad clip 1.0
-- **Early stopping**: patience=15 on val_loss
-- **Post-hoc calibration**: Temperature scaling (T searched on val set, NLL minimized) + optimal classification threshold (F1 maximized on val set)
-- **Ensemble**: 3 models with seeds {42, 43, 44}, max 60 epochs each
-
-## V3 Baseline Results
-
-```
-              Test Acc  Win Rate(>55%)  Edge    High-Conf(≥0.70)
-Model 0 (42): 50.8%    54.3%          +4.7%   67.7%
-Model 1 (43): 50.5%    52.3%          +2.7%   63.5%
-Model 2 (44): 52.3%    55.1%          +5.5%   —
-```
-
-Key observations: overall accuracy near 50% (expected for efficient market), but high-confidence predictions (P>0.7) show 60-68% actual win rate. V4 targets improving calibration so these confidence buckets become more reliable.
-
-## Usage
+### 1. Clone
 
 ```bash
-# Train ensemble (3 models, ~20h each max)
-python tools/train_predictor.py
+git clone https://github.com/heyixuan2/ashare-neural-network.git
+cd ashare-neural-network
+```
 
-# Monitor training progress in real-time
+### 2. Create environment
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+If you don't have a `requirements.txt` yet, install the core packages manually:
+
+```bash
+pip install torch tushare numpy pandas python-dotenv
+```
+
+### 3. Train
+
+```bash
+python tools/train_predictor.py
+```
+
+### 4. Monitor training
+
+```bash
 python monitor_training.py
 ```
 
-## Project Structure
+## Recommended way to use the trained models
 
+Use the pretrained ensemble from `models/`.
+
+```python
+from tools.price_predictor import StockPredictor
+
+models = StockPredictor.load_ensemble("models/", n_models=10)
 ```
+
+The intended inference flow is:
+
+1. Fetch recent stock prices
+2. Fetch market / sector / northbound / extra data
+3. Build features with `_feature_engineer(...)`
+4. Build the last 30-day sequence
+5. Load the 10 pretrained models
+6. Run each model once
+7. Average the predictions
+
+That gives you a deployable probability `P(up)`.
+
+## Why 1-day only?
+
+Earlier versions predicted 1d / 3d / 5d together. In testing, 3-day and 5-day targets were close to random, so the project was simplified to focus all model capacity on the only horizon that showed usable signal: **next trading day**.
+
+## High-level model design
+
+Current model family:
+
+```text
+Input features → Linear + LayerNorm + GELU
+→ LSTM (1 layer)
+→ Transformer Encoder (2 layers, 4 heads)
+→ Attention Pooling
+→ MLP head
+→ P(up tomorrow)
+```
+
+The model is intentionally small (~140K params) because daily stock prediction is a weak-signal problem and larger models tended to overfit quickly.
+
+## Data and features
+
+### Universe
+- ~5800 A-share stocks
+- 2022-01-01 to present
+- Forward-adjusted prices (前复权)
+
+### Feature groups
+The model uses stock-level and market-context features such as:
+
+- Returns and moving-average ratios
+- Volatility and ATR
+- RSI / MACD / Bollinger / KDJ
+- Candlestick structure
+- OBV and gap features
+- Industry encoding
+- Calendar signals
+- Market return + relative strength
+- Valuation and turnover
+- Money flow
+- Margin trading features
+- Sector return and sector-relative strength
+- Northbound flow (HSGT)
+
+Latest training version uses **48 features** after removing several low-value / harmful features identified by permutation importance.
+
+## Training setup
+
+- Walk-forward temporal split
+- 5 trading-day gap between train / val / test to prevent label leakage
+- Memory-mapped `.npy` pipeline for large datasets
+- AdamW optimizer
+- Gradient accumulation
+- Early stopping
+- 10 random seeds for stability testing
+- Permutation importance on the best model
+
+## Results, in plain English
+
+This is not a “90% accuracy” kind of problem. A-share daily direction is noisy and close to efficient.
+
+What matters here is not raw overall accuracy alone, but whether **high-confidence predictions** have a measurable edge.
+
+Recent training runs showed:
+- overall accuracy is only modestly above 50%
+- high-confidence buckets can show materially better win rate
+- best runs reached roughly **5%–12% edge** in stronger confidence regions
+
+So the project is better thought of as a **signal ranking / confidence filtering system**, not a magic all-stocks-always-right predictor.
+
+## Project structure
+
+```text
 ashare-neural-network/
 ├── tools/
-│   ├── train_predictor.py    # Data collection + training pipeline
-│   └── price_predictor.py    # Feature engineering + model definition + inference
-├── monitor_training.py       # Real-time training dashboard
-├── models/                   # Trained weights, meta, loss curves
-│   └── splits/               # Train/val/test data (.npy, mmap)
-├── data/ashare_daily/        # Permanent raw data backup
-└── .cache/                   # Tushare API response cache
+│   ├── train_predictor.py      # data collection + training pipeline
+│   └── price_predictor.py      # feature engineering + model definition + loading
+├── monitor_training.py         # terminal training dashboard
+├── models/                     # checkpoints, meta, loss curves, feature importance
+│   └── splits/                 # train/val/test data (.npy, mmap)
+├── data/ashare_daily/          # permanent raw OHLCV backup
+└── .cache/                     # Tushare API cache
 ```
+
+## Recommended next step for deployment
+
+The main missing production step is a helper like:
+
+```python
+predict_with_ensemble(symbol)
+```
+
+That function should:
+- fetch stock + global context data
+- build the latest 48-dim feature tensor
+- load the 10 pretrained models
+- average predictions
+- return a final probability and confidence bucket
+
+Once that is added, the trained system is ready to plug into a frontend or API service.
+
+## Version history
+
+- **V2**: multi-horizon (1d/3d/5d), much larger model
+- **V3**: switched to 1d-only, much smaller model
+- **V4**: simpler loss / threshold logic / seed stability search
+- **V4.1**: removed harmful features, improved warmup / regularization, 48-feature setup
 
 ## Requirements
 
 - Python 3.10+
 - PyTorch (MPS / CUDA / CPU)
-- tushare, numpy, pandas, python-dotenv
+- tushare
+- numpy
+- pandas
+- python-dotenv
 
 ## License
 
