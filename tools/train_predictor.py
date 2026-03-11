@@ -835,7 +835,6 @@ def train(data, max_hours=72, seed=42, model_id=0):
     log(f"Model: {total_params:,} parameters")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
-    warmup_steps = steps_per_epoch  # 1 epoch warmup: stabilize initial gradient direction across seeds
 
     # Plain BCE with valid-sample masking (0.5 = unknown label, skip)
     class MaskedBCE(nn.Module):
@@ -849,7 +848,9 @@ def train(data, max_hours=72, seed=42, model_id=0):
     criterion = MaskedBCE()
 
     accum_steps = 8  # V4.1: effective batch 2048 — reduce gradient noise across seeds
+    warmup_steps = steps_per_epoch // accum_steps  # optimizer steps in 1 epoch
     log(f"Effective batch size: {batch_size * accum_steps} (micro={batch_size} × accum={accum_steps})")
+    log(f"Warmup: {warmup_steps} optimizer steps (1 epoch)")
 
     best_val_loss = float('inf')
     best_val_acc = 0
@@ -1158,6 +1159,18 @@ def train_ensemble(data, n_models=3, max_hours_per_model=24):
 
     all_results = []
     for i in range(n_models):
+        suffix = f"_{i}" if i > 0 else ""
+        meta_path = MODEL_DIR / f"predictor_meta{suffix}.json"
+        checkpoint_path = MODEL_DIR / f"predictor_best{suffix}.pt"
+
+        if meta_path.exists() and checkpoint_path.exists():
+            meta = json.loads(meta_path.read_text())
+            if "test_avg_accuracy" in meta:
+                log(f"Model {i} (seed={42+i}): already complete "
+                    f"(test={meta['test_avg_accuracy']}%), skipping")
+                all_results.append(str(meta_path))
+                continue
+
         log(f"\n{'='*60}")
         log(f"Model {i+1}/{n_models} (seed={42+i})")
         log(f"{'='*60}")
